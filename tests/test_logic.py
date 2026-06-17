@@ -142,3 +142,124 @@ def test_load_config_bad_json_falls_back_to_defaults(tmp_path, monkeypatch):
     monkeypatch.setattr(ss, "_config_path", lambda: str(path))
     cfg = ss.load_config()
     assert cfg == ss.DEFAULT_CONFIG
+
+
+# ---------------------------------------------------------------------------
+# lcid_to_primary_lang / iso_to_primary_lang
+# ---------------------------------------------------------------------------
+
+def test_lcid_single_value():
+    assert ss.lcid_to_primary_lang("409") == 0x09   # en-US
+    assert ss.lcid_to_primary_lang("416") == 0x16   # pt-BR
+    assert ss.lcid_to_primary_lang("40C") == 0x0C   # fr-FR
+
+
+def test_lcid_strips_sublanguage_bits():
+    # The primary id is the low 10 bits; sublanguage (region) is masked off.
+    assert ss.lcid_to_primary_lang("816") == 0x16   # pt-PT -> still Portuguese
+
+
+def test_lcid_multivalue_takes_first_parseable():
+    assert ss.lcid_to_primary_lang("409;9") == 0x09
+    assert ss.lcid_to_primary_lang(" ; 416 ; 409") == 0x16
+
+
+@pytest.mark.parametrize("bad", [None, "", "   ", "zzz", ";", "xyz;qqq"])
+def test_lcid_garbage_returns_none(bad):
+    assert ss.lcid_to_primary_lang(bad) is None
+
+
+def test_iso_maps_common_languages():
+    assert ss.iso_to_primary_lang("en") == 0x09
+    assert ss.iso_to_primary_lang("pt") == 0x16
+    assert ss.iso_to_primary_lang("PT") == 0x16  # case-insensitive
+    assert ss.iso_to_primary_lang("zh-cn") == 0x04
+
+
+@pytest.mark.parametrize("bad", [None, "", "xx", "klingon"])
+def test_iso_unknown_returns_none(bad):
+    assert ss.iso_to_primary_lang(bad) is None
+
+
+def test_lcid_and_iso_agree_round_trip():
+    # A voice tagged en-US and text detected as 'en' must land on the same id.
+    assert ss.lcid_to_primary_lang("409") == ss.iso_to_primary_lang("en")
+    assert ss.lcid_to_primary_lang("416") == ss.iso_to_primary_lang("pt")
+
+
+# ---------------------------------------------------------------------------
+# voice_for_language / plan_voices  (detection injected; no langdetect / SAPI)
+# ---------------------------------------------------------------------------
+
+# Sentinel "tokens" -- the logic only ever passes them through.
+EN = "EN_VOICE"
+PT = "PT_VOICE"
+EN_PREF = "EN_PREFERRED_VOICE"
+FALLBACK = "FALLBACK_VOICE"
+LANG_INDEX = {0x09: EN, 0x16: PT}     # first installed voice per language
+NO_OVERRIDES = {}
+
+
+def test_voice_for_language_uses_lang_index_when_no_override():
+    assert ss.voice_for_language("pt", NO_OVERRIDES, LANG_INDEX, FALLBACK) == PT
+    assert ss.voice_for_language("en", NO_OVERRIDES, LANG_INDEX, FALLBACK) == EN
+
+
+def test_voice_for_language_override_takes_precedence():
+    overrides = {0x09: EN_PREF}
+    assert ss.voice_for_language("en", overrides, LANG_INDEX, FALLBACK) == EN_PREF
+    # A language without an override still uses the first installed match.
+    assert ss.voice_for_language("pt", overrides, LANG_INDEX, FALLBACK) == PT
+
+
+def test_voice_for_language_unmatched_and_unknown_fall_back():
+    assert ss.voice_for_language("fr", NO_OVERRIDES, LANG_INDEX, FALLBACK) == FALLBACK
+    assert ss.voice_for_language(None, NO_OVERRIDES, LANG_INDEX, FALLBACK) == FALLBACK
+    assert ss.voice_for_language("xx", NO_OVERRIDES, LANG_INDEX, FALLBACK) == FALLBACK
+
+
+def test_plan_auto_off_uses_fallback_for_every_chunk():
+    chunks = ["One.", "Two."]
+    plan = ss.plan_voices(False, False, chunks, "One. Two.", NO_OVERRIDES,
+                          LANG_INDEX, FALLBACK, detect=lambda t: "pt")
+    assert plan == [(FALLBACK, "One."), (FALLBACK, "Two.")]
+
+
+def test_plan_per_selection_picks_one_voice_from_full_text():
+    chunks = ["Olá.", "Tudo bem?"]
+    plan = ss.plan_voices(True, False, chunks, "Olá. Tudo bem?", NO_OVERRIDES,
+                          LANG_INDEX, FALLBACK, detect=lambda t: "pt")
+    assert plan == [(PT, "Olá."), (PT, "Tudo bem?")]
+
+
+def test_plan_per_sentence_switches_each_chunk():
+    chunks = ["Hello there.", "Olá pessoal."]
+
+    def fake_detect(text):
+        return "pt" if "Olá" in text else "en"
+
+    plan = ss.plan_voices(True, True, chunks, "ignored", NO_OVERRIDES,
+                          LANG_INDEX, FALLBACK, detect=fake_detect)
+    assert plan == [(EN, "Hello there."), (PT, "Olá pessoal.")]
+
+
+def test_plan_uses_preferred_override():
+    chunks = ["Hello."]
+    overrides = {0x09: EN_PREF}
+    plan = ss.plan_voices(True, False, chunks, "Hello.", overrides,
+                          LANG_INDEX, FALLBACK, detect=lambda t: "en")
+    assert plan == [(EN_PREF, "Hello.")]
+
+
+def test_plan_unmatched_language_falls_back():
+    chunks = ["Bonjour."]
+    plan = ss.plan_voices(True, False, chunks, "Bonjour.", NO_OVERRIDES,
+                          LANG_INDEX, FALLBACK, detect=lambda t: "fr")
+    assert plan == [(FALLBACK, "Bonjour.")]
+
+
+def test_plan_detection_failure_falls_back():
+    chunks = ["???"]
+    plan = ss.plan_voices(True, False, chunks, "???", NO_OVERRIDES,
+                          LANG_INDEX, FALLBACK, detect=lambda t: None)
+    assert plan == [(FALLBACK, "???")]

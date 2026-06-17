@@ -56,6 +56,9 @@ DEFAULT_CONFIG = {
     "read_button": 2,           # 2 = forward (XBUTTON2), 1 = back (XBUTTON1)
     "stop_button": 1,
     "swallow_side_buttons": True,
+    "auto_switch_voice": False,  # pick a voice matching the detected language
+    "per_sentence_switch": False,  # when auto on: detect per sentence vs per read
+    "preferred_voices": [],     # voice ids; the one per language to prefer
 }
 
 CAPTURE_TIMEOUT_MS = 400
@@ -183,6 +186,121 @@ def split_sentences(text):
         if part:
             chunks.append(part)
     return chunks
+
+
+# ----------------------------------------------------------------------------
+# Language detection -> voice matching
+# ----------------------------------------------------------------------------
+# Each SAPI voice token reports a "Language" attribute as one or more hex LCIDs
+# (e.g. "409" = en-US, "416" = pt-BR, "409;9"). The low 10 bits are the primary
+# language id, which is what we match against the detected language of the text.
+
+# Map langdetect's ISO 639-1 codes to Windows primary language ids. Only the
+# common ones; anything unlisted simply won't auto-match (we fall back).
+ISO_TO_PRIMARY_LANG = {
+    "ar": 0x01, "bg": 0x02, "ca": 0x03, "zh-cn": 0x04, "zh-tw": 0x04,
+    "cs": 0x05, "da": 0x06, "de": 0x07, "el": 0x08, "en": 0x09, "es": 0x0A,
+    "fi": 0x0B, "fr": 0x0C, "he": 0x0D, "hu": 0x0E, "is": 0x0F, "it": 0x10,
+    "ja": 0x11, "ko": 0x12, "nl": 0x13, "no": 0x14, "pl": 0x15, "pt": 0x16,
+    "ro": 0x18, "ru": 0x19, "hr": 0x1A, "sk": 0x1B, "sq": 0x1C, "sv": 0x1D,
+    "th": 0x1E, "tr": 0x1F, "ur": 0x20, "id": 0x21, "uk": 0x22, "vi": 0x2A,
+}
+
+# Friendly names for primary language ids, for the Settings UI.
+PRIMARY_LANG_NAMES = {
+    0x01: "Arabic", 0x02: "Bulgarian", 0x03: "Catalan", 0x04: "Chinese",
+    0x05: "Czech", 0x06: "Danish", 0x07: "German", 0x08: "Greek",
+    0x09: "English", 0x0A: "Spanish", 0x0B: "Finnish", 0x0C: "French",
+    0x0D: "Hebrew", 0x0E: "Hungarian", 0x0F: "Icelandic", 0x10: "Italian",
+    0x11: "Japanese", 0x12: "Korean", 0x13: "Dutch", 0x14: "Norwegian",
+    0x15: "Polish", 0x16: "Portuguese", 0x18: "Romanian", 0x19: "Russian",
+    0x1A: "Croatian", 0x1B: "Slovak", 0x1C: "Albanian", 0x1D: "Swedish",
+    0x1E: "Thai", 0x1F: "Turkish", 0x20: "Urdu", 0x21: "Indonesian",
+    0x22: "Ukrainian", 0x2A: "Vietnamese",
+}
+
+
+def primary_lang_name(prim):
+    """Human-readable name for a primary language id, for display."""
+    if prim is None:
+        return "Unknown"
+    return PRIMARY_LANG_NAMES.get(prim, "0x%X" % prim)
+
+
+def lcid_to_primary_lang(hexstr):
+    """Parse a SAPI 'Language' attribute (hex LCID, possibly ';'-separated) into
+    a primary language id. Returns the first parseable id, or None."""
+    if not hexstr:
+        return None
+    for part in str(hexstr).split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            return int(part, 16) & 0x3FF
+        except ValueError:
+            continue
+    return None
+
+
+def iso_to_primary_lang(iso):
+    """Map a langdetect ISO code (e.g. 'en', 'pt', 'zh-cn') to a primary
+    language id, or None if we don't have a mapping."""
+    if not iso:
+        return None
+    return ISO_TO_PRIMARY_LANG.get(iso.lower())
+
+
+def detect_language(text):
+    """Best-effort offline language detection. Returns an ISO 639-1 code (e.g.
+    'en', 'pt') or None. langdetect is imported lazily and seeded so results are
+    deterministic; any failure (empty text, no model, ambiguous) yields None."""
+    if not text or not text.strip():
+        return None
+    try:
+        from langdetect import detect, DetectorFactory
+        DetectorFactory.seed = 0
+        return detect(text)
+    except Exception:
+        return None
+
+
+def voice_for_language(iso, overrides, lang_index, fallback):
+    """Resolve a voice token for a detected ISO language code.
+
+    Precedence: a user `overrides` choice for that language wins; else the first
+    installed voice for the language (`lang_index`); else `fallback`. Both
+    `overrides` and `lang_index` are keyed by primary language id (int).
+    """
+    prim = iso_to_primary_lang(iso)
+    if prim is not None:
+        if prim in overrides:
+            return overrides[prim]
+        if prim in lang_index:
+            return lang_index[prim]
+    return fallback
+
+
+def plan_voices(auto, per_sentence, chunks, full_text, overrides, lang_index,
+                fallback, detect=detect_language):
+    """Decide which voice token speaks each chunk.
+
+    Returns a list of (token, chunk) pairs in order. When auto is off every
+    chunk uses `fallback`. `overrides` (user preferred voice per language) and
+    `lang_index` (first installed voice per language) are keyed by primary
+    language id. `detect` is injectable so the logic can be tested without
+    langdetect.
+    """
+    if not auto:
+        return [(fallback, c) for c in chunks]
+
+    def pick(text):
+        return voice_for_language(detect(text), overrides, lang_index, fallback)
+
+    if per_sentence:
+        return [(pick(c), c) for c in chunks]
+    tok = pick(full_text)
+    return [(tok, c) for c in chunks]
 
 
 # ============================================================================
@@ -524,6 +642,10 @@ class SpeakSelectionApp:
         self.breathing_room_ms = int(cfg["breathing_room_ms"])
         self.read_button = int(cfg["read_button"])
         self.stop_button = int(cfg["stop_button"])
+        self.auto_switch = bool(cfg["auto_switch_voice"])
+        self.per_sentence = bool(cfg["per_sentence_switch"])
+        pv = cfg["preferred_voices"]
+        self.preferred_voices = list(pv) if isinstance(pv, list) else []
         self.swallow = threading.Event()
         if cfg["swallow_side_buttons"]:
             self.swallow.set()
@@ -550,6 +672,13 @@ class SpeakSelectionApp:
         self._breath_var = None
         self._breath_label = None
         self._swallow_var = None
+        self._auto_switch_var = None
+        self._per_sentence_var = None
+        self._pref_listbox = None
+        self._pref_add_combo = None
+        self._pref_view = []
+        self._all_voices = []
+        self._voice_by_id = {}
         self._read_combo = None
         self._stop_combo = None
 
@@ -566,6 +695,9 @@ class SpeakSelectionApp:
             "read_button": int(self.read_button),
             "stop_button": int(self.stop_button),
             "swallow_side_buttons": self.swallow.is_set(),
+            "auto_switch_voice": bool(self.auto_switch),
+            "per_sentence_switch": bool(self.per_sentence),
+            "preferred_voices": list(self.preferred_voices),
         }
         try:
             os.makedirs(_config_dir(), exist_ok=True)
@@ -638,15 +770,77 @@ class SpeakSelectionApp:
             return False
 
     @staticmethod
-    def _speak_chunks(voice, chunks):
-        # SAPI queues each async Speak and plays them in order, so we just feed
-        # the chunks sequentially. A STOP/READ purge later clears the whole
-        # queue at once, so interruption stays instant.
-        for chunk in chunks:
+    def _build_voice_index(voice):
+        """Read each voice token's SAPI 'Language' attribute and return three
+        maps used for auto voice switching:
+          by_lang   primary language id -> token (first installed match)
+          by_id     voice id            -> token
+          id_to_prim voice id           -> primary language id
+        """
+        by_lang, by_id, id_to_prim = {}, {}, {}
+        try:
+            voices = voice.GetVoices()
+            for i in range(voices.Count):
+                tok = voices.Item(i)
+                try:
+                    vid = tok.Id
+                except Exception:
+                    vid = None
+                try:
+                    lang_attr = tok.GetAttribute("Language")
+                except Exception:
+                    lang_attr = None
+                prim = lcid_to_primary_lang(lang_attr)
+                if vid is not None:
+                    by_id[vid] = tok
+                    if prim is not None:
+                        id_to_prim[vid] = prim
+                if prim is not None and prim not in by_lang:
+                    by_lang[prim] = tok
+        except Exception:
+            log.exception("could not build voice language index")
+        return by_lang, by_id, id_to_prim
+
+    def _preferred_overrides(self, by_id, id_to_prim):
+        """Build a primary-language-id -> token map from the user's preferred
+        voice list. First preferred voice for a language wins (the add flow
+        keeps one per language, but we guard here too)."""
+        overrides = {}
+        for vid in self.preferred_voices:
+            prim = id_to_prim.get(vid)
+            tok = by_id.get(vid)
+            if prim is not None and tok is not None and prim not in overrides:
+                overrides[prim] = tok
+        return overrides
+
+    def _plan_voices(self, chunks, full_text, overrides, lang_index, fallback):
+        return plan_voices(self.auto_switch, self.per_sentence, chunks,
+                           full_text, overrides, lang_index, fallback)
+
+    def _speak_plan(self, voice, plan, current_id):
+        """Speak each (token, chunk) pair. SAPI queues async Speak calls and
+        plays them in order; a STOP/READ purge clears the whole queue at once so
+        interruption stays instant. Switching voice resets the rate, so we
+        re-apply it. `current_id` tracks the active voice across calls (the
+        breathing-room deadline speaks a deferred plan later)."""
+        for tok, chunk in plan:
+            if tok is not None:
+                try:
+                    tid = tok.Id
+                except Exception:
+                    tid = None
+                if tid is not None and tid != current_id:
+                    try:
+                        voice.Voice = tok
+                        voice.Rate = speed_to_rate(self.speed)
+                        current_id = tid
+                    except Exception:
+                        log.exception("could not switch voice")
             try:
                 voice.Speak(chunk, SVSF_ASYNC)
             except Exception:
                 log.exception("speak chunk failed")
+        return current_id
 
     @staticmethod
     def _apply_voice(voice, vid, default_token):
@@ -687,7 +881,24 @@ class SpeakSelectionApp:
             except Exception:
                 pass
 
-            pending_chunks = None
+            # For auto voice switching: language/id token maps, and the
+            # currently-selected token used as the fallback when auto is off or
+            # no installed voice matches the detected language.
+            lang_index, by_id, id_to_prim = self._build_voice_index(voice)
+
+            def current_token_id():
+                try:
+                    return voice.Voice.Id
+                except Exception:
+                    return None
+
+            try:
+                fallback_token = voice.Voice
+            except Exception:
+                fallback_token = default_token
+            current_id = current_token_id()
+
+            pending_plan = None
             deadline = None
 
             while True:
@@ -700,9 +911,10 @@ class SpeakSelectionApp:
                     cmd = None
 
                 if cmd is None:
-                    if pending_chunks is not None:
-                        self._speak_chunks(voice, pending_chunks)
-                        pending_chunks = None
+                    if pending_plan is not None:
+                        current_id = self._speak_plan(voice, pending_plan,
+                                                      current_id)
+                        pending_plan = None
                         deadline = None
                     continue
 
@@ -719,10 +931,16 @@ class SpeakSelectionApp:
                         voice.Speak("", SVSF_PURGE | SVSF_ASYNC)
                     except Exception:
                         pass
-                    pending_chunks = None
+                    pending_plan = None
                     deadline = None
                 elif kind == "SET_VOICE":
                     self._apply_voice(voice, cmd[1], default_token)
+                    # The manual pick becomes the new fallback/default voice.
+                    try:
+                        fallback_token = voice.Voice
+                    except Exception:
+                        pass
+                    current_id = current_token_id()
                 elif kind == "SET_RATE":
                     try:
                         voice.Rate = speed_to_rate(cmd[1])
@@ -735,25 +953,48 @@ class SpeakSelectionApp:
                         voices = voice.GetVoices()
                         for i in range(voices.Count):
                             tok = voices.Item(i)
-                            out.append((tok.Id, tok.GetDescription()))
+                            try:
+                                prim = lcid_to_primary_lang(
+                                    tok.GetAttribute("Language"))
+                            except Exception:
+                                prim = None
+                            out.append((tok.Id, tok.GetDescription(), prim))
                     except Exception:
                         log.exception("could not list voices")
                     resp.put(out)
-                elif kind == "READ":
-                    chunks = split_sentences(cmd[1])
-                    if not chunks:
-                        continue
-                    was_playing = self._is_speaking(voice) or (pending_chunks is not None)
+                elif kind == "SAY":
+                    # Speak specific text in a specific voice, bypassing
+                    # auto-switch (used for Settings samples so the sample always
+                    # matches the voice you picked).
+                    say_chunks = split_sentences(cmd[1])
+                    vid = cmd[2]
+                    tok = by_id.get(vid) if vid else fallback_token
                     try:
                         voice.Speak("", SVSF_PURGE | SVSF_ASYNC)
                     except Exception:
                         pass
+                    current_id = self._speak_plan(
+                        voice, [(tok, c) for c in say_chunks], current_id)
+                    pending_plan = None
+                    deadline = None
+                elif kind == "READ":
+                    chunks = split_sentences(cmd[1])
+                    if not chunks:
+                        continue
+                    was_playing = self._is_speaking(voice) or (pending_plan is not None)
+                    try:
+                        voice.Speak("", SVSF_PURGE | SVSF_ASYNC)
+                    except Exception:
+                        pass
+                    overrides = self._preferred_overrides(by_id, id_to_prim)
+                    plan = self._plan_voices(chunks, cmd[1], overrides,
+                                             lang_index, fallback_token)
                     if was_playing:
-                        pending_chunks = chunks
+                        pending_plan = plan
                         deadline = time.monotonic() + (self.breathing_room_ms / 1000.0)
                     else:
-                        self._speak_chunks(voice, chunks)
-                        pending_chunks = None
+                        current_id = self._speak_plan(voice, plan, current_id)
+                        pending_plan = None
                         deadline = None
         finally:
             comtypes.CoUninitialize()
@@ -767,8 +1008,12 @@ class SpeakSelectionApp:
             log.warning("voice list timed out")
             return []
 
-    def _speak_sample(self):
-        self.speech_q.put(("READ", SAMPLE_TEXT))
+    def _speak_sample(self, voice_id=None):
+        # SAY bypasses auto-switch so the sample is always heard in the chosen
+        # voice (defaults to the manually selected one).
+        if voice_id is None:
+            voice_id = self.voice_id
+        self.speech_q.put(("SAY", SAMPLE_TEXT, voice_id))
 
     # ----- mouse hook wiring --------------------------------------------
 
@@ -878,6 +1123,13 @@ class SpeakSelectionApp:
                                         insertbackground=p["fg"])
             except Exception:
                 pass
+        if self._pref_listbox is not None:
+            try:
+                self._pref_listbox.configure(bg=p["field"], fg=p["fg"],
+                                            selectbackground=p["sel"],
+                                            selectforeground=p["fg"])
+            except Exception:
+                pass
         if self.log_win is not None:
             try:
                 self.log_win.configure(bg=p["bg"])
@@ -912,21 +1164,33 @@ class SpeakSelectionApp:
         win = tk.Toplevel(self.root)
         self.settings_win = win
         win.title("Speak Selection \u2014 Settings")
-        win.resizable(False, False)
+        win.resizable(True, True)
         win.protocol("WM_DELETE_WINDOW", self._hide_settings)
+        # Let the content frame fill (and grow with) the window.
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
 
         frm = ttk.Frame(win, padding=16)
         frm.grid(row=0, column=0, sticky="nsew")
         frm.columnconfigure(1, weight=1)
 
-        voices = self._request_voices()
-        self._voice_items = [("__default__", "(system default)")] + voices
+        # voices: list of (id, description, primary_lang_id)
+        self._all_voices = self._request_voices()
+        self._voice_by_id = {vid: (desc, prim)
+                             for vid, desc, prim in self._all_voices}
+        self._voice_items = ([("__default__", "(system default)")]
+                             + [(vid, desc) for vid, desc, _ in self._all_voices])
         descs = [d for _, d in self._voice_items]
+
+        # Size selection widgets to the longest voice name so it fits on open
+        # (bounded so a very long name can't make the window huge; the user can
+        # still resize freely and the field grows with the window).
+        self._name_w = max(28, min(64, max((len(d) for d in descs), default=28)))
 
         r = 0
         ttk.Label(frm, text="Voice").grid(row=r, column=0, sticky="w", pady=6)
         self._voice_combo = ttk.Combobox(frm, values=descs, state="readonly",
-                                        width=36)
+                                        width=self._name_w)
         cur = 0
         for i, (vid, _) in enumerate(self._voice_items):
             if vid == self.voice_id or (vid == "__default__" and self.voice_id is None):
@@ -936,6 +1200,23 @@ class SpeakSelectionApp:
         self._voice_combo.grid(row=r, column=1, columnspan=2, sticky="ew", pady=6)
         self._voice_combo.bind("<<ComboboxSelected>>", self._on_voice_select)
         r += 1
+
+        self._auto_switch_var = tk.BooleanVar(value=self.auto_switch)
+        ttk.Checkbutton(frm, text="Auto-switch voice by detected language",
+                        variable=self._auto_switch_var,
+                        command=self._on_auto_switch_toggle).grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        r += 1
+
+        self._per_sentence_var = tk.BooleanVar(value=self.per_sentence)
+        ttk.Checkbutton(
+            frm, text="    └ detect per sentence (else per selection)",
+            variable=self._per_sentence_var,
+            command=self._on_per_sentence_toggle).grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        r += 1
+
+        r = self._build_preferred_voices(frm, r)
 
         ttk.Label(frm, text="Speed").grid(row=r, column=0, sticky="w", pady=6)
         self._speed_var = tk.DoubleVar(value=self.speed)
@@ -991,8 +1272,104 @@ class SpeakSelectionApp:
 
         self._apply_theme(read_dark_mode())
         win.update_idletasks()
+        # Open at least as large as the content needs (nothing clipped), and
+        # don't let the user shrink below that. They can enlarge freely.
+        win.minsize(win.winfo_reqwidth(), win.winfo_reqheight())
         win.lift()
         win.focus_force()
+
+    # ----- preferred voices (per-language overrides) --------------------
+
+    def _build_preferred_voices(self, frm, r):
+        ttk.Label(frm, text="Preferred voices").grid(row=r, column=0,
+                                                     sticky="nw", pady=(8, 0))
+        ttk.Label(frm, foreground="gray",
+                  text="One per language. Used when auto-switch is on.").grid(
+            row=r, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        r += 1
+
+        box = ttk.Frame(frm)
+        box.grid(row=r, column=0, columnspan=3, sticky="nsew", pady=(2, 6))
+        box.columnconfigure(0, weight=1)
+        box.rowconfigure(0, weight=1)
+        # This is the row that should absorb extra height when the window grows.
+        frm.rowconfigure(r, weight=1)
+        yscroll = ttk.Scrollbar(box, orient="vertical")
+        lb = tk.Listbox(box, height=4, activestyle="none",
+                        width=getattr(self, "_name_w", 36) + 14,
+                        yscrollcommand=yscroll.set, exportselection=False)
+        yscroll.config(command=lb.yview)
+        lb.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        self._pref_listbox = lb
+        r += 1
+
+        ctrl = ttk.Frame(frm)
+        ctrl.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+        ctrl.columnconfigure(0, weight=1)
+        self._pref_add_combo = ttk.Combobox(
+            ctrl, values=[d for _, d, _ in self._all_voices],
+            state="readonly", width=getattr(self, "_name_w", 36))
+        self._pref_add_combo.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(ctrl, text="Add / replace", command=self._on_pref_add).grid(
+            row=0, column=1, padx=(0, 4))
+        ttk.Button(ctrl, text="Remove", command=self._on_pref_remove).grid(
+            row=0, column=2)
+        r += 1
+
+        self._refresh_pref_listbox()
+        return r
+
+    def _refresh_pref_listbox(self):
+        lb = self._pref_listbox
+        if lb is None:
+            return
+        self._pref_view = []
+        try:
+            lb.delete(0, "end")
+            for vid in self.preferred_voices:
+                info = self._voice_by_id.get(vid)
+                if not info:
+                    continue  # a previously-preferred voice no longer installed
+                desc, prim = info
+                lb.insert("end", f"{primary_lang_name(prim)}  —  {desc}")
+                self._pref_view.append(vid)
+        except Exception:
+            log.exception("could not refresh preferred voices list")
+
+    def _on_pref_add(self):
+        idx = self._pref_add_combo.current()
+        if idx < 0 or idx >= len(self._all_voices):
+            return
+        vid, _desc, prim = self._all_voices[idx]
+        # Keep one preferred voice per language: drop any existing same-language
+        # pick, then add this one.
+        new_list = []
+        for existing in self.preferred_voices:
+            ex = self._voice_by_id.get(existing)
+            if ex and prim is not None and ex[1] == prim:
+                continue
+            if existing != vid:
+                new_list.append(existing)
+        new_list.append(vid)
+        self.preferred_voices = new_list
+        self.save_config()
+        self._refresh_pref_listbox()
+        self._speak_sample(vid)  # preview the voice you just assigned
+
+    def _on_pref_remove(self):
+        if self._pref_listbox is None:
+            return
+        sel = self._pref_listbox.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        if i < 0 or i >= len(self._pref_view):
+            return
+        vid = self._pref_view[i]
+        self.preferred_voices = [v for v in self.preferred_voices if v != vid]
+        self.save_config()
+        self._refresh_pref_listbox()
 
     def _on_voice_select(self, _evt):
         idx = self._voice_combo.current()
@@ -1029,6 +1406,14 @@ class SpeakSelectionApp:
             self.swallow.set()
         else:
             self.swallow.clear()
+        self.save_config()
+
+    def _on_auto_switch_toggle(self):
+        self.auto_switch = bool(self._auto_switch_var.get())
+        self.save_config()
+
+    def _on_per_sentence_toggle(self):
+        self.per_sentence = bool(self._per_sentence_var.get())
         self.save_config()
 
     def _on_read_button(self, _evt):

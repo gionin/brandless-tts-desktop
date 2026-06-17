@@ -23,7 +23,21 @@ to set up for the UI. To confirm: `py -c "import tkinter; print(tkinter.TkVersio
 ## Settings window
 
 - **Voice** — pick any SAPI5 voice installed on the machine. Changing it speaks
-  a short sample.
+  a short sample. With auto-switch on, this is the fallback voice.
+- **Auto-switch voice by detected language** — when on, the app detects the
+  language of the captured text and speaks it with an installed voice whose
+  language matches (e.g. an English selection uses an English voice, a
+  Portuguese one a Portuguese voice). If no installed voice matches, it falls
+  back to the **Voice** picked above. Detection is fully offline (langdetect).
+  - **detect per sentence** — sub-option: when on, each sentence is detected and
+    voiced independently (good for mixed-language text, but short sentences
+    detect less reliably). When off (default), the whole selection is detected
+    once and read with a single voice.
+- **Preferred voices** — a list of voices to use for auto-switching, one per
+  language. Add a voice (it previews, and replaces any existing pick for the
+  same language) or remove one. When auto-switch detects a language you have a
+  preferred voice for, it uses that voice; otherwise it falls back to the first
+  installed voice for the language, then to the **Voice** chosen above.
 - **Speed** — 0.5x to 2.0x. Samples on release. (SAPI's rate is a coarse
   integer scale, so the slider snaps to the nearest step.)
 - **Breathing room** — the gap (ms) before a new read starts when it interrupts
@@ -48,11 +62,29 @@ The window reads your current Windows light/dark setting and matches it, and
 re-checks while open so flipping the OS theme updates it within a couple
 seconds.
 
+## Getting more (and more natural) voices
+
+The app speaks through any voice registered with **SAPI5**, so the way to get
+better voices is to make more of them visible to SAPI — no app changes needed.
+
+- **Windows natural (neural) voices** sound far better than the classic ones but
+  are normally locked to Narrator. Install them under **Settings → Accessibility
+  → Narrator → Add natural voices** (or **Time & Language → Speech**). They're
+  local and run offline.
+- To expose those (and the older OneCore voices) to SAPI apps like this one,
+  install **[NaturalVoiceSAPIAdapter](https://github.com/gexgd0419/NaturalVoiceSAPIAdapter)**:
+  download a release, run `Installer.exe` as administrator, and on 64-bit Windows
+  install **both** the 32-bit and 64-bit versions. It can also enable free
+  Microsoft Edge online voices (these need internet).
+
+Once installed, the new voices show up in the **Voice** dropdown and are
+eligible for auto language switching automatically. Restart the app after
+installing voices so it re-reads the list.
+
 ## Known limits (by design, for now)
 
 - Only clipboard **text** is preserved/restored during capture; images or file
   lists on the clipboard aren't brought back yet.
-- Single voice selection only. Per-language auto-switching is a later milestone.
 - Text is now split into sentence-sized chunks before speaking (cleaner pacing
   and steadier playback of long selections), but pause/resume/skip aren't
   wired up — chunks are fed straight to SAPI's own queue.
