@@ -437,6 +437,20 @@ def read_dark_mode():
         return False
 
 
+def make_icon_image():
+    """The tray glyph: a rounded square with a play triangle. Module-level so
+    the build script can reuse it to render the packaged .exe icon."""
+    from PIL import Image, ImageDraw
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    gray = (136, 136, 136, 255)
+    d.rounded_rectangle([6, 6, size - 6, size - 6], radius=12,
+                        outline=gray, width=4)
+    d.polygon([(26, 22), (26, 42), (44, 32)], fill=gray)
+    return img
+
+
 def palette(dark):
     if dark:
         return dict(bg="#2b2b2b", fg="#e8e8e8", field="#3c3c3c",
@@ -717,18 +731,6 @@ class SpeakSelectionApp:
 
     # ----- tray ----------------------------------------------------------
 
-    @staticmethod
-    def _make_icon_image():
-        from PIL import Image, ImageDraw
-        size = 64
-        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        gray = (136, 136, 136, 255)
-        d.rounded_rectangle([6, 6, size - 6, size - 6], radius=12,
-                            outline=gray, width=4)
-        d.polygon([(26, 22), (26, 42), (44, 32)], fill=gray)
-        return img
-
     def _on_speak_clipboard(self, icon, item):
         text = _Win32.get().get_text()
         if text and text.strip():
@@ -772,7 +774,7 @@ class SpeakSelectionApp:
             Menu.SEPARATOR,
             Item("Quit", self._on_quit),
         )
-        self.icon = pystray.Icon("speak_selection", self._make_icon_image(),
+        self.icon = pystray.Icon("speak_selection", make_icon_image(),
                                 "Speak Selection", menu=menu)
 
     # ----- theming -------------------------------------------------------
@@ -1139,8 +1141,10 @@ class SpeakSelectionApp:
 # ============================================================================
 
 def _log_path():
-    here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, "speak_selection.log")
+    # Kept next to config.json under %APPDATA%\SpeakSelection so the program
+    # folder (and the repo) stays free of runtime artifacts. Works the same
+    # whether running from source or as a packaged .exe.
+    return os.path.join(_config_dir(), "speak_selection.log")
 
 
 def _setup_logging():
@@ -1149,6 +1153,7 @@ def _setup_logging():
     root.setLevel(logging.INFO)
 
     try:
+        os.makedirs(_config_dir(), exist_ok=True)
         fh = logging.FileHandler(_log_path(), mode="w", encoding="utf-8")
         fh.setFormatter(fmt)
         root.addHandler(fh)

@@ -8,7 +8,7 @@ preferences.
 
 ```
 install.bat     (once, to install dependencies via the py launcher)
-run.bat         (each time; keeps the console open and logs to speak_selection.log)
+run.bat         (each time; keeps the console open and logs to the log file)
 ```
 
 tkinter ships with the standard python.org install, so there's nothing extra
@@ -35,10 +35,12 @@ to set up for the UI. To confirm: `py -c "import tkinter; print(tkinter.TkVersio
 
 Everything saves immediately. No Save button.
 
-## Where settings live
+## Where settings (and the log) live
 
-`%APPDATA%\SpeakSelection\config.json`. Delete it to reset to defaults. It's
-seeded from defaults on first run, then the file wins.
+`%APPDATA%\SpeakSelection\`. `config.json` holds your preferences — delete it to
+reset to defaults; it's seeded from defaults on first run, then the file wins.
+`speak_selection.log` sits alongside it, rewritten on each launch. Keeping both
+out of the program folder means the repo (and a packaged build) stay clean.
 
 ## Theme
 
@@ -55,9 +57,9 @@ seconds.
 
 ## If something breaks
 
-The app logs to `speak_selection.log` next to the script, overwritten each run.
-`run.bat` also keeps the console open. Send the bottom of either if you hit a
-problem.
+The app logs to `%APPDATA%\SpeakSelection\speak_selection.log`, overwritten each
+run. `run.bat` also keeps the console open. Send the bottom of either if you hit
+a problem.
 
 ## Note on where this was built
 
@@ -83,8 +85,8 @@ watch output live.
 
 ### Where did the console text go?
 Nowhere — it's still logged. Open the tray menu and choose **Show log...** to
-see the live log inside a window. It also still writes to `speak_selection.log`
-next to the script.
+see the live log inside a window. It also still writes to the log file in
+`%APPDATA%\SpeakSelection\`.
 
 ### Side buttons were still navigating — fixed
 The button "swallow" now uses our own low-level mouse hook rather than the
@@ -99,3 +101,25 @@ Settings window and then exits, the way Steam re-focuses instead of opening
 twice. This uses a named mutex plus a named event (local OS objects, no network
 and no firewall prompts). If the app ever crashes, the lock frees itself when
 the process ends, so there's no stale-lock problem.
+
+---
+
+## Building a standalone .exe
+
+`build.bat` packages everything into a single windowless executable so it can
+run on a machine **without Python installed**.
+
+```
+build.bat
+```
+
+It installs PyInstaller and the runtime deps, renders the tray glyph into a
+proper multi-resolution `.ico` for the executable, then produces
+`dist\SpeakSelection.exe` (one file, no console). The intermediate `build\`,
+`dist\`, `*.spec`, and the temporary icon are all git-ignored.
+
+Double-click `dist\SpeakSelection.exe` to run it like any other app — it behaves
+exactly as running from source, with config and the log living in
+`%APPDATA%\SpeakSelection\`. To start it at login, point a shortcut in your
+Startup folder at the exe (the `install_startup.bat` route is for running from
+source under `pyw`).

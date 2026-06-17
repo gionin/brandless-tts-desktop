@@ -24,3 +24,5 @@ speak_selection.log
 build/
 dist/
 *.spec
+build_icon.ico
+/SpeakSelection.exe
