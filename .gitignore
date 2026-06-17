@@ -17,6 +17,7 @@ __pycache__/
 .venv/
 venv/
 env/
+.pytest_cache/
 
 # Runtime / build artifacts
 speak_selection.log

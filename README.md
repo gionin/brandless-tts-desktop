@@ -106,6 +106,17 @@ the process ends, so there's no stale-lock problem.
 
 ---
 
+## Running the tests
+
+The Windows-independent logic (sentence chunking, speed mapping, config
+loading) has unit tests that run on any platform — no SAPI, mouse hook, or
+display needed.
+
+```
+py -m pip install -r requirements-dev.txt
+py -m pytest
+```
+
 ## Building a standalone .exe
 
 `build.bat` packages everything into a single windowless executable so it can
