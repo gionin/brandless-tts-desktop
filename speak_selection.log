@@ -1,11 +1,11 @@
-2026-06-17 12:44:47,135 INFO starting. python=3.11.9 platform=win32
-2026-06-17 12:44:47,135 INFO config: C:\Users\Pichau\AppData\Roaming\SpeakSelection\config.json
-2026-06-17 12:44:47,244 INFO mouse hook installed
-2026-06-17 12:44:47,307 INFO ready. read=2 stop=1 swallow=True speed=1.30
-2026-06-17 12:44:47,312 INFO Imported existing <module 'comtypes.gen' from 'C:\\Users\\Pichau\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages\\comtypes\\gen\\__init__.py'>
-2026-06-17 12:44:47,312 INFO Using writeable comtypes cache directory: 'C:\Users\Pichau\AppData\Local\Programs\Python\Python311\Lib\site-packages\comtypes\gen'
-2026-06-17 12:44:50,133 INFO captured 64 chars
-2026-06-17 12:44:51,332 INFO captured 64 chars
-2026-06-17 12:44:57,363 INFO captured 90 chars
-2026-06-17 12:45:02,476 INFO captured 168 chars
-2026-06-17 12:45:41,268 INFO mouse hook removed
+2026-06-17 12:49:39,594 INFO starting. python=3.11.9 platform=win32
+2026-06-17 12:49:39,599 INFO config: C:\Users\Pichau\AppData\Roaming\SpeakSelection\config.json
+2026-06-17 12:49:39,718 INFO mouse hook installed
+2026-06-17 12:49:39,782 INFO ready. read=2 stop=1 swallow=True speed=1.30
+2026-06-17 12:49:39,784 INFO Imported existing <module 'comtypes.gen' from 'C:\\Users\\Pichau\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages\\comtypes\\gen\\__init__.py'>
+2026-06-17 12:49:39,784 INFO Using writeable comtypes cache directory: 'C:\Users\Pichau\AppData\Local\Programs\Python\Python311\Lib\site-packages\comtypes\gen'
+2026-06-17 12:50:08,663 INFO captured 295 chars
+2026-06-17 12:50:27,084 INFO captured 63 chars
+2026-06-17 12:50:34,261 INFO captured 155 chars
+2026-06-17 12:50:45,613 INFO captured 115 chars
+2026-06-17 12:50:58,328 INFO captured 1272 chars
