@@ -53,7 +53,9 @@ seconds.
 - Only clipboard **text** is preserved/restored during capture; images or file
   lists on the clipboard aren't brought back yet.
 - Single voice selection only. Per-language auto-switching is a later milestone.
-- No sentence chunking yet, so pause/resume/skip aren't here either.
+- Text is now split into sentence-sized chunks before speaking (cleaner pacing
+  and steadier playback of long selections), but pause/resume/skip aren't
+  wired up — chunks are fed straight to SAPI's own queue.
 
 ## If something breaks
 

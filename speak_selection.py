@@ -35,6 +35,7 @@ import logging
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -130,6 +131,58 @@ def speed_to_rate(speed):
     speed = max(0.5, min(2.0, float(speed)))
     rate = round(10.0 * math.log(speed, 3.0))
     return int(max(-10, min(10, rate)))
+
+
+# ----------------------------------------------------------------------------
+# Sentence chunking
+# ----------------------------------------------------------------------------
+# We split captured text into sentence-sized chunks and feed them to SAPI one
+# at a time (it queues async Speak calls internally and plays them in order).
+# This isn't about pause/skip — it's a cleaner foundation plus a clarity win:
+# collapsing newlines/whitespace (common in selections from PDFs or wrapped
+# text) stops SAPI from pausing oddly at line breaks, and very long run-ons get
+# hard-wrapped into bounded units. Over-splitting is harmless: SAPI just speaks
+# one more short chunk.
+
+MAX_CHUNK_CHARS = 240
+
+# Split at whitespace that follows sentence-final punctuation and precedes the
+# likely start of a new sentence (an optional opening quote/bracket then an
+# uppercase letter or digit). Avoids breaking "3.14" (no space) while tolerating
+# the odd over-split like "Mr. Smith".
+_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=["\'(\[]?[A-Z0-9])')
+
+
+def split_sentences(text):
+    """Normalize whitespace and break text into bounded, sentence-ish chunks.
+
+    Returns a list of non-empty strings in reading order. Empty/whitespace-only
+    input yields an empty list.
+    """
+    if not text:
+        return []
+    norm = re.sub(r'\s+', ' ', text).strip()
+    if not norm:
+        return []
+
+    chunks = []
+    for part in _SENT_SPLIT.split(norm):
+        part = part.strip()
+        if not part:
+            continue
+        # Hard-wrap an over-long run-on (no sentence punctuation) at the last
+        # space before the cap so no single chunk is unbounded.
+        while len(part) > MAX_CHUNK_CHARS:
+            cut = part.rfind(' ', 0, MAX_CHUNK_CHARS)
+            if cut <= 0:
+                cut = MAX_CHUNK_CHARS
+            head = part[:cut].strip()
+            if head:
+                chunks.append(head)
+            part = part[cut:].strip()
+        if part:
+            chunks.append(part)
+    return chunks
 
 
 # ============================================================================
@@ -585,6 +638,17 @@ class SpeakSelectionApp:
             return False
 
     @staticmethod
+    def _speak_chunks(voice, chunks):
+        # SAPI queues each async Speak and plays them in order, so we just feed
+        # the chunks sequentially. A STOP/READ purge later clears the whole
+        # queue at once, so interruption stays instant.
+        for chunk in chunks:
+            try:
+                voice.Speak(chunk, SVSF_ASYNC)
+            except Exception:
+                log.exception("speak chunk failed")
+
+    @staticmethod
     def _apply_voice(voice, vid, default_token):
         try:
             if not vid:
@@ -623,7 +687,7 @@ class SpeakSelectionApp:
             except Exception:
                 pass
 
-            pending_text = None
+            pending_chunks = None
             deadline = None
 
             while True:
@@ -636,12 +700,9 @@ class SpeakSelectionApp:
                     cmd = None
 
                 if cmd is None:
-                    if pending_text is not None:
-                        try:
-                            voice.Speak(pending_text, SVSF_ASYNC)
-                        except Exception:
-                            log.exception("speak (pending) failed")
-                        pending_text = None
+                    if pending_chunks is not None:
+                        self._speak_chunks(voice, pending_chunks)
+                        pending_chunks = None
                         deadline = None
                     continue
 
@@ -658,7 +719,7 @@ class SpeakSelectionApp:
                         voice.Speak("", SVSF_PURGE | SVSF_ASYNC)
                     except Exception:
                         pass
-                    pending_text = None
+                    pending_chunks = None
                     deadline = None
                 elif kind == "SET_VOICE":
                     self._apply_voice(voice, cmd[1], default_token)
@@ -679,21 +740,20 @@ class SpeakSelectionApp:
                         log.exception("could not list voices")
                     resp.put(out)
                 elif kind == "READ":
-                    text = cmd[1]
-                    was_playing = self._is_speaking(voice) or (pending_text is not None)
+                    chunks = split_sentences(cmd[1])
+                    if not chunks:
+                        continue
+                    was_playing = self._is_speaking(voice) or (pending_chunks is not None)
                     try:
                         voice.Speak("", SVSF_PURGE | SVSF_ASYNC)
                     except Exception:
                         pass
                     if was_playing:
-                        pending_text = text
+                        pending_chunks = chunks
                         deadline = time.monotonic() + (self.breathing_room_ms / 1000.0)
                     else:
-                        try:
-                            voice.Speak(text, SVSF_ASYNC)
-                        except Exception:
-                            log.exception("speak failed")
-                        pending_text = None
+                        self._speak_chunks(voice, chunks)
+                        pending_chunks = None
                         deadline = None
         finally:
             comtypes.CoUninitialize()
