@@ -125,12 +125,13 @@ HL_COLOR = "#ff9500"   # underline color
 HL_THICKNESS = 3       # px
 HL_ALPHA = 0.9
 
-# TEMPORARY SAFETY SWITCH. The Tk click-through overlay blocked mouse input on
-# the user's machine (twice), and we can't verify click-through remotely. While
-# disabled, no overlay window is ever created, so the app cannot block clicks.
-# The rest of the highlight pipeline stays intact for when we ship a verified
-# rendering. Flip to True only once click-through is proven safe.
-HIGHLIGHT_OVERLAY_ENABLED = False
+# Click-through overlay. The earlier lockout was caused by applying the
+# transparent style to the wrong window handle (Tk wraps top-levels, so
+# winfo_id() is a child); HighlightBar now targets the real top-level via
+# GetAncestor(GA_ROOT). Verified with spike_overlay.py: the styles land on the
+# top-level and WindowFromPoint confirms clicks pass through. A watchdog also
+# auto-hides the bar if updates stop, so it can never get stuck on screen.
+HIGHLIGHT_OVERLAY_ENABLED = True
 
 
 # ============================================================================
@@ -890,6 +891,10 @@ class HighlightBar:
             u32 = ctypes.windll.user32
             u32.GetAncestor.restype = wintypes.HWND
             u32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+            u32.GetWindowLongW.restype = ctypes.c_long
+            u32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+            u32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int,
+                                           ctypes.c_long]
             u32.SetLayeredWindowAttributes.argtypes = [
                 wintypes.HWND, wintypes.DWORD, wintypes.BYTE, wintypes.DWORD]
             hwnd = u32.GetAncestor(w.winfo_id(), 2)  # GA_ROOT
@@ -928,6 +933,9 @@ class HighlightBar:
             except Exception:
                 pass
             self._visible = False
+
+    def is_visible(self):
+        return self.win is not None and self._visible
 
     def destroy(self):
         if self.win is not None:
@@ -973,6 +981,7 @@ class SpeakSelectionApp:
         self._hl_spans = None
         self._hl_index_to_box = None
         self._hl_last_idx = None
+        self._hl_last_activity = 0.0   # for the stuck-bar watchdog
 
         self.hook = None
         self.icon = None
@@ -1563,8 +1572,8 @@ class SpeakSelectionApp:
             Menu.SEPARATOR,
             Item("Swallow side buttons", self._on_toggle_swallow,
                  checked=self._swallow_checked),
-            Item("Highlight words while reading (disabled)",
-                 self._on_toggle_highlight, checked=self._highlight_checked),
+            Item("Highlight words while reading", self._on_toggle_highlight,
+                 checked=self._highlight_checked),
             Item("Show log...", self._on_show_log),
             Menu.SEPARATOR,
             Item("Quit", self._on_quit),
@@ -1739,9 +1748,7 @@ class SpeakSelectionApp:
 
         self._highlight_var = tk.BooleanVar(value=self.highlight)
         ttk.Checkbutton(
-            frm,
-            text="Highlight (underline) each word while reading "
-                 "(temporarily disabled)",
+            frm, text="Highlight (underline) each word while reading",
             variable=self._highlight_var,
             command=self._on_highlight_toggle).grid(
             row=r, column=0, columnspan=3, sticky="w", pady=(0, 6))
@@ -2006,6 +2013,7 @@ class SpeakSelectionApp:
 
     def _handle_hl(self, msg):
         kind = msg[0]
+        self._hl_last_activity = time.monotonic()
         if kind == "HL_MAP":
             _, gen, spans, index_to_box = msg
             self._hl_cur_gen = gen
@@ -2051,6 +2059,12 @@ class SpeakSelectionApp:
                     return
         except queue.Empty:
             pass
+
+        # Watchdog: if the bar is showing but highlight updates have stopped
+        # (e.g. a lost HL_END), hide it so it can never stay stuck on screen.
+        if (self._hl_bar is not None and self._hl_bar.is_visible()
+                and time.monotonic() - self._hl_last_activity > 3.0):
+            self._hl_bar.hide()
 
         self._tick_count += 1
 

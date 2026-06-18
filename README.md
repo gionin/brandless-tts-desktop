@@ -53,13 +53,14 @@ Everything saves immediately. No Save button.
 
 ## Word highlighting while reading
 
-> **Temporarily disabled.** The click-through overlay could block mouse input on
-> some systems, so the overlay is switched off via `HIGHLIGHT_OVERLAY_ENABLED`
-> in `speak_selection.py` (the toggle is inert until a verified-safe overlay
-> lands). The detection/OCR/matching pipeline below remains in place.
-
 With this on (Settings checkbox or the tray menu), a thin underline bar follows
 the word being spoken — in **any** app, including browsers and PDF readers.
+
+The overlay is click-through (it never intercepts your mouse): the transparent
+style is applied to the real top-level window via `GetAncestor(GA_ROOT)`, which
+an earlier version got wrong. A watchdog also auto-hides the bar if updates stop,
+so it can't get stuck on screen. (`HIGHLIGHT_OVERLAY_ENABLED` in
+`speak_selection.py` is the master switch.)
 
 It works by screenshotting the source window when you start a read, using
 Windows' built-in OCR (`winocr`) to find where each word is on screen, and
