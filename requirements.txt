@@ -3,3 +3,6 @@ pynput>=1.7.6
 pystray>=0.19.4
 Pillow>=9.0.0
 langdetect>=1.0.9
+# Word-highlighting (optional): wraps Windows' built-in OCR. Pulls in winsdk,
+# which is sizable. The app runs fine without it; highlighting just no-ops.
+winocr>=0.0.10

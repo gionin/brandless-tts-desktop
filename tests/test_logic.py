@@ -296,3 +296,89 @@ def test_gdi_handle_formats_are_skipped(fmt):
 ])
 def test_memory_formats_are_copyable(fmt):
     assert ss.is_copyable_clipboard_format(fmt) is True
+
+
+# ---------------------------------------------------------------------------
+# Highlighter: word spans / offset mapping / chunk spans / alignment
+# ---------------------------------------------------------------------------
+
+def test_word_spans_basic():
+    assert ss.word_spans("ab cd  ef") == [(0, 2), (3, 5), (7, 9)]
+
+
+def test_word_spans_empty():
+    assert ss.word_spans("   ") == []
+
+
+def test_word_at_offset_inside_and_whitespace():
+    spans = ss.word_spans("ab cd ef")  # (0,2)(3,5)(6,8)
+    assert ss.word_at_offset(spans, 0) == 0   # start of "ab"
+    assert ss.word_at_offset(spans, 1) == 0   # inside "ab"
+    assert ss.word_at_offset(spans, 2) == 1   # whitespace -> next word
+    assert ss.word_at_offset(spans, 4) == 1   # inside "cd"
+    assert ss.word_at_offset(spans, 7) == 2   # inside "ef"
+    assert ss.word_at_offset(spans, 99) is None
+
+
+def test_split_sentences_spans_are_exact_substrings():
+    text = "Hello there.  How are\nyou? I am fine."
+    out = ss.split_sentences_spans(text)
+    assert len(out) >= 2
+    for chunk, base in out:
+        assert text[base:base + len(chunk)] == chunk  # exact substring
+        assert chunk == chunk.strip()                 # trimmed
+
+
+def test_split_sentences_spans_offsets_map_back():
+    text = "Alpha beta. Gamma delta."
+    out = ss.split_sentences_spans(text)
+    # The second chunk should start at the real index of "Gamma".
+    assert out[0][0] == "Alpha beta."
+    assert out[1][0] == "Gamma delta."
+    assert out[1][1] == text.index("Gamma")
+
+
+def test_split_sentences_spans_hard_wraps_long_runon():
+    text = "word " * 200  # no sentence punctuation
+    out = ss.split_sentences_spans(text)
+    assert len(out) > 1
+    for chunk, base in out:
+        assert len(chunk) <= ss.MAX_CHUNK_CHARS
+        assert text[base:base + len(chunk)] == chunk
+
+
+def test_normalize_token_strips_punctuation_and_case():
+    assert ss.normalize_token("Hello,") == "hello"
+    assert ss.normalize_token("DON'T") == "dont"
+    assert ss.normalize_token("...") == ""
+
+
+def test_align_words_exact():
+    spoken = ["The", "quick", "brown", "fox"]
+    ocr = ["The", "quick", "brown", "fox"]
+    assert ss.align_words(spoken, ocr) == {0: 0, 1: 1, 2: 2, 3: 3}
+
+
+def test_align_words_ignores_leading_screen_noise():
+    spoken = ["quick", "brown", "fox"]
+    ocr = ["Menu", "File", "quick", "brown", "fox"]  # OCR caught UI chrome too
+    m = ss.align_words(spoken, ocr)
+    assert m == {0: 2, 1: 3, 2: 4}
+
+
+def test_align_words_tolerates_a_missed_word():
+    spoken = ["the", "quick", "brown", "fox"]
+    ocr = ["the", "brown", "fox"]  # OCR missed "quick"
+    m = ss.align_words(spoken, ocr)
+    assert m[0] == 0           # the
+    assert 1 not in m          # quick has no box -> highlight will hold/skip
+    assert m[2] == 1 and m[3] == 2
+
+
+def test_align_words_punctuation_tokens_do_not_cross_match():
+    spoken = ["hi", "--", "there"]
+    ocr = ["hi", "there"]
+    m = ss.align_words(spoken, ocr)
+    assert m[0] == 0
+    assert m[2] == 1
+    assert 1 not in m          # the "--" token must not match anything

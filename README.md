@@ -44,10 +44,36 @@ to set up for the UI. To confirm: `py -c "import tkinter; print(tkinter.TkVersio
   playing audio.
 - **Swallow side buttons** — when on, the side buttons only control speech and
   don't also do browser back/forward.
+- **Highlight (underline) each word while reading** — see "Word highlighting"
+  below. Off by default.
 - **Read / Stop button** — assign which physical side button does which. If you
   pick the same button for both, the other one auto-swaps so they never clash.
 
 Everything saves immediately. No Save button.
+
+## Word highlighting while reading
+
+> **Temporarily disabled.** The click-through overlay could block mouse input on
+> some systems, so the overlay is switched off via `HIGHLIGHT_OVERLAY_ENABLED`
+> in `speak_selection.py` (the toggle is inert until a verified-safe overlay
+> lands). The detection/OCR/matching pipeline below remains in place.
+
+With this on (Settings checkbox or the tray menu), a thin underline bar follows
+the word being spoken — in **any** app, including browsers and PDF readers.
+
+It works by screenshotting the source window when you start a read, using
+Windows' built-in OCR (`winocr`) to find where each word is on screen, and
+matching that to the text being spoken. Because it reads pixels, it isn't
+limited to apps that expose their text — but it inherits OCR's limits:
+
+- **Occasional skips.** If OCR misses a word, the bar holds on the previous word
+  until the next word it did detect.
+- **On-screen text only.** Only what's visible when the read starts is tracked;
+  scrolling mid-read isn't followed (yet).
+- **Best at 100% display scaling.** Alignment is calibrated for physical pixels;
+  other scales may drift slightly.
+- Needs `winocr` (in `requirements.txt`). Without it, highlighting simply does
+  nothing and reading is unaffected.
 
 ## Where settings (and the log) live
 

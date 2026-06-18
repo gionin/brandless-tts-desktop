@@ -27,3 +27,6 @@ dist/
 *.spec
 build_icon.ico
 /SpeakSelection.exe
+
+# Throwaway spikes
+spike_*

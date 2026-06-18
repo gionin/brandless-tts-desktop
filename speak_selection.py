@@ -30,6 +30,7 @@ Run with a console (debug): run.bat
 """
 
 import collections
+import difflib
 import json
 import logging
 import math
@@ -59,6 +60,7 @@ DEFAULT_CONFIG = {
     "auto_switch_voice": False,  # pick a voice matching the detected language
     "per_sentence_switch": False,  # when auto on: detect per sentence vs per read
     "preferred_voices": [],     # voice ids; the one per language to prefer
+    "highlight_while_reading": False,  # OCR-based underline of the spoken word
 }
 
 CAPTURE_TIMEOUT_MS = 400
@@ -112,6 +114,23 @@ BTN_FORWARD = 2
 BTN_BACK = 1
 BTN_LABELS = {BTN_FORWARD: "Forward (front side button)",
             BTN_BACK: "Back (rear side button)"}
+
+# Reading highlighter: a thin underline bar under the spoken word.
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_NOACTIVATE = 0x08000000
+WS_EX_TOOLWINDOW = 0x00000080
+HL_COLOR = "#ff9500"   # underline color
+HL_THICKNESS = 3       # px
+HL_ALPHA = 0.9
+
+# TEMPORARY SAFETY SWITCH. The Tk click-through overlay blocked mouse input on
+# the user's machine (twice), and we can't verify click-through remotely. While
+# disabled, no overlay window is ever created, so the app cannot block clicks.
+# The rest of the highlight pipeline stays intact for when we ship a verified
+# rendering. Flip to True only once click-through is proven safe.
+HIGHLIGHT_OVERLAY_ENABLED = False
 
 
 # ============================================================================
@@ -199,6 +218,125 @@ def split_sentences(text):
         if part:
             chunks.append(part)
     return chunks
+
+
+# ----------------------------------------------------------------------------
+# Offset-preserving chunking + word mapping (for the reading highlighter)
+# ----------------------------------------------------------------------------
+# Normal reading normalizes whitespace (nicer pacing) but that loses the link
+# between a SAPI character offset and the original text. In highlight mode we
+# instead speak exact substrings of the captured text, so SAPI's reported
+# offset maps straight back to a word we can locate on screen.
+
+def _emit_chunk_spans(text, start, end, out):
+    """Append (substring, base_offset) pieces of text[start:end] to out, after
+    trimming surrounding whitespace and hard-wrapping over-long runs. Every
+    emitted chunk is an exact substring of text (text[base:base+len] == chunk)."""
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    while end - start > MAX_CHUNK_CHARS:
+        cut = text.rfind(" ", start, start + MAX_CHUNK_CHARS)
+        if cut <= start:
+            cut = start + MAX_CHUNK_CHARS
+        piece_end = cut
+        while piece_end > start and text[piece_end - 1].isspace():
+            piece_end -= 1
+        if piece_end > start:
+            out.append((text[start:piece_end], start))
+        start = cut
+        while start < end and text[start].isspace():
+            start += 1
+    if end > start:
+        out.append((text[start:end], start))
+
+
+def split_sentences_spans(text):
+    """Like split_sentences, but returns (chunk, base_offset) pairs where each
+    chunk is an exact substring of `text` at `base_offset` (no whitespace
+    normalization), so SAPI offsets stay aligned to the original text."""
+    if not text:
+        return []
+    spans = []
+    last = 0
+    for m in _SENT_SPLIT.finditer(text):
+        _emit_chunk_spans(text, last, m.start(), spans)
+        last = m.end()
+    _emit_chunk_spans(text, last, len(text), spans)
+    return spans
+
+
+def word_spans(text):
+    """Character spans (start, end) of each whitespace-delimited word."""
+    return [(m.start(), m.end()) for m in re.finditer(r"\S+", text)]
+
+
+def word_at_offset(spans, offset):
+    """Index of the word span containing `offset`; if `offset` lands in
+    whitespace, the next word; None if past the end."""
+    for i, (s, e) in enumerate(spans):
+        if offset < e:
+            return i
+    return None
+
+
+def normalize_token(s):
+    """Lowercase, keep only alphanumerics — for fuzzy word matching."""
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+
+def align_words(spoken_tokens, ocr_tokens):
+    """Map spoken-word index -> OCR-word index via fuzzy sequence alignment.
+
+    Tolerates OCR misses/misreads and ignores extra on-screen words that aren't
+    part of the selection. Tokens that normalize to empty (pure punctuation) are
+    made unique so they never match across the two lists.
+    """
+    def prep(tokens):
+        out = []
+        for i, t in enumerate(tokens):
+            n = normalize_token(t)
+            out.append(n if n else "\x00%d" % i)  # unmatchable sentinel
+        return out
+
+    sp = prep(spoken_tokens)
+    oc = prep(ocr_tokens)
+    sm = difflib.SequenceMatcher(a=sp, b=oc, autojunk=False)
+    mapping = {}
+    for a, b, size in sm.get_matching_blocks():
+        for k in range(size):
+            mapping[a + k] = b + k
+    return mapping
+
+
+def ocr_words(image, origin=(0, 0)):
+    """OCR a PIL image with Windows' built-in engine. Returns a list of
+    (text, (x, y, w, h)) in reading order, with boxes offset by `origin` to
+    screen coordinates. Returns None if winocr is unavailable or OCR fails."""
+    try:
+        import winocr
+    except Exception:
+        log.warning("winocr not installed; word highlighting unavailable")
+        return None
+    try:
+        result = winocr.recognize_pil_sync(image, "en-US")
+    except Exception:
+        log.exception("OCR failed")
+        return None
+    ox, oy = origin
+    words = []
+    try:
+        for line in result["lines"]:
+            for w in line["words"]:
+                r = w["bounding_rect"]
+                words.append((w["text"],
+                              (int(r["x"]) + ox, int(r["y"]) + oy,
+                               int(r["width"]), int(r["height"]))))
+    except Exception:
+        log.exception("could not parse OCR result")
+        return None
+    return words
 
 
 # ----------------------------------------------------------------------------
@@ -718,6 +856,91 @@ def palette(dark):
 
 
 # ============================================================================
+# Reading highlighter: a single thin underline bar that follows the spoken word
+# ============================================================================
+
+class HighlightBar:
+    """One reused borderless, click-through, topmost window drawn as a thin bar
+    under the current word. Lives on the Tk main thread."""
+
+    def __init__(self, root):
+        self.root = root
+        self.win = None
+        self._visible = False
+        self._geom = None
+
+    def _ensure(self):
+        if self.win is not None:
+            return
+        w = tk.Toplevel(self.root)
+        w.overrideredirect(True)
+        w.attributes("-topmost", True)
+        w.configure(bg=HL_COLOR)
+        w.geometry("1x1+0+0")
+        w.withdraw()
+        w.update_idletasks()
+        # Make it click-through. Critically, apply the styles to the *real*
+        # top-level HWND (Tk wraps toplevels, so winfo_id() can be a child), and
+        # manage visibility with LWA_ALPHA on that same window so transparency
+        # (click-through) and alpha live together. This is what was broken
+        # before — the styles landed on the wrong window and clicks were eaten.
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u32 = ctypes.windll.user32
+            u32.GetAncestor.restype = wintypes.HWND
+            u32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+            u32.SetLayeredWindowAttributes.argtypes = [
+                wintypes.HWND, wintypes.DWORD, wintypes.BYTE, wintypes.DWORD]
+            hwnd = u32.GetAncestor(w.winfo_id(), 2)  # GA_ROOT
+            ex = u32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            u32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                               ex | WS_EX_LAYERED | WS_EX_TRANSPARENT
+                               | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+            u32.SetLayeredWindowAttributes(
+                hwnd, 0, int(255 * HL_ALPHA), 0x2)  # LWA_ALPHA
+        except Exception:
+            log.exception("could not set highlight-bar styles")
+        self.win = w
+
+    def show(self, x, y, w, h):
+        if not HIGHLIGHT_OVERLAY_ENABLED:   # safety: never create a window
+            return
+        try:
+            self._ensure()
+            width = max(1, int(w))
+            by = int(y) + int(h)            # underline at the word's baseline
+            geom = "%dx%d+%d+%d" % (width, HL_THICKNESS, int(x), by)
+            if geom != self._geom:          # skip redundant moves
+                self.win.geometry(geom)
+                self._geom = geom
+            if not self._visible:           # restack only when first shown,
+                self.win.deiconify()        # not on every word (that was the lag)
+                self.win.lift()
+                self._visible = True
+        except Exception:
+            log.exception("highlight show failed")
+
+    def hide(self):
+        if self.win is not None and self._visible:
+            try:
+                self.win.withdraw()
+            except Exception:
+                pass
+            self._visible = False
+
+    def destroy(self):
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
+            self.win = None
+            self._visible = False
+            self._geom = None
+
+
+# ============================================================================
 # The app
 # ============================================================================
 
@@ -734,6 +957,7 @@ class SpeakSelectionApp:
         pv = cfg["preferred_voices"]
         self.preferred_voices = list(pv) if isinstance(pv, list) else []
         self._lang_warmed = False
+        self.highlight = bool(cfg["highlight_while_reading"])
         self.swallow = threading.Event()
         if cfg["swallow_side_buttons"]:
             self.swallow.set()
@@ -741,6 +965,14 @@ class SpeakSelectionApp:
         self.speech_q = queue.Queue()
         self.capture_q = queue.Queue()
         self.ui_q = queue.Queue()
+        self._hl_gen_counter = 0          # bumped per highlight read (capture thread)
+
+        # Reading-highlight UI state (main thread only)
+        self._hl_bar = None
+        self._hl_cur_gen = None
+        self._hl_spans = None
+        self._hl_index_to_box = None
+        self._hl_last_idx = None
 
         self.hook = None
         self.icon = None
@@ -762,6 +994,7 @@ class SpeakSelectionApp:
         self._swallow_var = None
         self._auto_switch_var = None
         self._per_sentence_var = None
+        self._highlight_var = None
         self._pref_listbox = None
         self._pref_add_combo = None
         self._pref_view = []
@@ -786,6 +1019,7 @@ class SpeakSelectionApp:
             "auto_switch_voice": bool(self.auto_switch),
             "per_sentence_switch": bool(self.per_sentence),
             "preferred_voices": list(self.preferred_voices),
+            "highlight_while_reading": bool(self.highlight),
         }
         try:
             os.makedirs(_config_dir(), exist_ok=True)
@@ -841,9 +1075,62 @@ class SpeakSelectionApp:
                 text = None
             if text:
                 log.info("captured %d chars", len(text))
-                self.speech_q.put(("READ", text))
+                gen = None
+                if self.highlight and HIGHLIGHT_OVERLAY_ENABLED:
+                    # Build the word->box map BEFORE speaking so the very first
+                    # word can be highlighted (OCR takes ~250 ms; doing it up
+                    # front adds that to the read's start, only when highlight
+                    # is on). The map reaches the UI before any HL offset.
+                    self._hl_gen_counter += 1
+                    gen = self._hl_gen_counter
+                    spans, index_to_box = self._prepare_highlight(text)
+                    self.ui_q.put(("HL_MAP", gen, spans, index_to_box))
+                self.speech_q.put(("READ", text, gen))
             else:
                 log.info("no selection captured")
+
+    @staticmethod
+    def _grab_foreground():
+        """Screenshot the foreground window. Returns (PIL image, (x, y) origin)
+        or (None, (0, 0))."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u32 = ctypes.windll.user32
+            hwnd = u32.GetForegroundWindow()
+            if not hwnd:
+                return None, (0, 0)
+            rect = wintypes.RECT()
+            u32.GetWindowRect(hwnd, ctypes.byref(rect))
+            l, t, r, b = rect.left, rect.top, rect.right, rect.bottom
+            if r <= l or b <= t:
+                return None, (0, 0)
+            from PIL import ImageGrab
+            img = ImageGrab.grab(bbox=(l, t, r, b))
+            return img, (l, t)
+        except Exception:
+            log.exception("foreground grab failed")
+            return None, (0, 0)
+
+    def _prepare_highlight(self, text):
+        """Screenshot the foreground window, OCR it, and fuzzy-align the detected
+        words to `text`. Returns (word_spans, {word_index: screen_box}). Runs on
+        the capture thread before speaking so the map is ready for word one."""
+        spans = word_spans(text)
+        index_to_box = {}
+        try:
+            image, origin = self._grab_foreground()
+            if image is not None:
+                ocr = ocr_words(image, origin)
+                if ocr:
+                    spoken_tokens = [text[s:e] for s, e in spans]
+                    ocr_tokens = [t for t, _box in ocr]
+                    mapping = align_words(spoken_tokens, ocr_tokens)
+                    for sp_idx, ocr_idx in mapping.items():
+                        index_to_box[sp_idx] = ocr[ocr_idx][1]
+        except Exception:
+            log.exception("highlight prep failed")
+        return spans, index_to_box
 
     # ----- speech -------------------------------------------------------
 
@@ -903,12 +1190,16 @@ class SpeakSelectionApp:
                            full_text, overrides, lang_index, fallback)
 
     def _speak_plan(self, voice, plan, current_id):
-        """Speak each (token, chunk) pair. SAPI queues async Speak calls and
-        plays them in order; a STOP/READ purge clears the whole queue at once so
-        interruption stays instant. Switching voice resets the rate, so we
-        re-apply it. `current_id` tracks the active voice across calls (the
-        breathing-room deadline speaks a deferred plan later)."""
-        for tok, chunk in plan:
+        """Speak each (token, chunk[, base]) item. SAPI queues async Speak calls
+        and plays them in order; a STOP/READ purge clears the whole queue at once
+        so interruption stays instant. Switching voice resets the rate, so we
+        re-apply it. Returns (current_id, stream_base) where stream_base maps the
+        SAPI stream number of each chunk to its base character offset in the
+        original text (used by the reading highlighter; base is None otherwise)."""
+        stream_base = {}
+        for item in plan:
+            tok, chunk = item[0], item[1]
+            base = item[2] if len(item) > 2 else None
             if tok is not None:
                 try:
                     tid = tok.Id
@@ -922,10 +1213,11 @@ class SpeakSelectionApp:
                     except Exception:
                         log.exception("could not switch voice")
             try:
-                voice.Speak(chunk, SVSF_ASYNC)
+                sid = voice.Speak(chunk, SVSF_ASYNC)
+                stream_base[int(sid)] = base
             except Exception:
                 log.exception("speak chunk failed")
-        return current_id
+        return current_id, stream_base
 
     @staticmethod
     def _apply_voice(voice, vid, default_token):
@@ -984,23 +1276,88 @@ class SpeakSelectionApp:
             current_id = current_token_id()
 
             pending_plan = None
+            pending_gen = None
             deadline = None
 
+            # Reading-highlight state. While a highlight read is speaking we poll
+            # SAPI's word position and emit offsets to the UI thread.
+            POLL_S = 0.03
+            hl_gen = None
+            hl_stream_base = {}
+            hl_last_off = -1
+            hl_started = False
+            hl_wait = 0  # polls spent waiting for speech to actually start
+
+            def emit_hl():
+                nonlocal hl_last_off
+                if hl_gen is None:
+                    return
+                try:
+                    st = voice.Status
+                    stream = int(st.CurrentStreamNumber)
+                    pos = int(st.InputWordPosition)
+                except Exception:
+                    return
+                base = hl_stream_base.get(stream)
+                if base is None:
+                    return
+                off = base + pos
+                if off != hl_last_off:
+                    hl_last_off = off
+                    try:
+                        self.ui_q.put_nowait(("HL", hl_gen, off))
+                    except Exception:
+                        pass
+
+            def end_hl():
+                nonlocal hl_gen, hl_stream_base, hl_last_off, hl_started, hl_wait
+                if hl_gen is not None:
+                    try:
+                        self.ui_q.put_nowait(("HL_END", hl_gen))
+                    except Exception:
+                        pass
+                hl_gen = None
+                hl_stream_base = {}
+                hl_last_off = -1
+                hl_started = False
+                hl_wait = 0
+
             while True:
-                timeout = None
+                timeouts = []
                 if deadline is not None:
-                    timeout = max(0.0, deadline - time.monotonic())
+                    timeouts.append(max(0.0, deadline - time.monotonic()))
+                if hl_gen is not None:
+                    timeouts.append(POLL_S)
+                timeout = min(timeouts) if timeouts else None
                 try:
                     cmd = self.speech_q.get(timeout=timeout)
                 except queue.Empty:
                     cmd = None
 
                 if cmd is None:
-                    if pending_plan is not None:
-                        current_id = self._speak_plan(voice, pending_plan,
-                                                      current_id)
+                    if (pending_plan is not None and deadline is not None
+                            and time.monotonic() >= deadline):
+                        current_id, sb = self._speak_plan(voice, pending_plan,
+                                                          current_id)
+                        if pending_gen is not None:
+                            hl_gen = pending_gen
+                            hl_stream_base = sb
+                            hl_last_off = -1
+                            hl_started = False
+                            hl_wait = 0
                         pending_plan = None
+                        pending_gen = None
                         deadline = None
+                    if hl_gen is not None:
+                        if self._is_speaking(voice):
+                            hl_started = True
+                            emit_hl()
+                        elif hl_started:
+                            end_hl()           # finished playing
+                        else:
+                            hl_wait += 1
+                            if hl_wait > 50:   # ~2s and never started; give up
+                                end_hl()
                     continue
 
                 kind = cmd[0]
@@ -1010,6 +1367,7 @@ class SpeakSelectionApp:
                         voice.Speak("", SVSF_PURGE | SVSF_ASYNC)
                     except Exception:
                         pass
+                    end_hl()
                     break
                 elif kind == "STOP":
                     try:
@@ -1017,7 +1375,9 @@ class SpeakSelectionApp:
                     except Exception:
                         pass
                     pending_plan = None
+                    pending_gen = None
                     deadline = None
+                    end_hl()
                 elif kind == "SET_VOICE":
                     self._apply_voice(voice, cmd[1], default_token)
                     # The manual pick becomes the new fallback/default voice.
@@ -1058,28 +1418,53 @@ class SpeakSelectionApp:
                         voice.Speak("", SVSF_PURGE | SVSF_ASYNC)
                     except Exception:
                         pass
-                    current_id = self._speak_plan(
-                        voice, [(tok, c) for c in say_chunks], current_id)
+                    end_hl()
+                    current_id, _ = self._speak_plan(
+                        voice, [(tok, c, None) for c in say_chunks], current_id)
                     pending_plan = None
+                    pending_gen = None
                     deadline = None
                 elif kind == "READ":
-                    chunks = split_sentences(cmd[1])
+                    text = cmd[1]
+                    gen = cmd[2] if len(cmd) > 2 else None
+                    highlight = gen is not None and self.highlight
+                    if highlight:
+                        chunk_bases = split_sentences_spans(text)
+                        chunks = [c for c, _b in chunk_bases]
+                    else:
+                        chunks = split_sentences(text)
                     if not chunks:
                         continue
-                    was_playing = self._is_speaking(voice) or (pending_plan is not None)
+                    was_playing = (self._is_speaking(voice)
+                                   or pending_plan is not None)
                     try:
                         voice.Speak("", SVSF_PURGE | SVSF_ASYNC)
                     except Exception:
                         pass
+                    end_hl()  # drop any in-progress highlight before the new read
                     overrides = self._preferred_overrides(by_id, id_to_prim)
-                    plan = self._plan_voices(chunks, cmd[1], overrides,
+                    plan = self._plan_voices(chunks, text, overrides,
                                              lang_index, fallback_token)
+                    if highlight:
+                        items = [(plan[i][0], chunks[i], chunk_bases[i][1])
+                                 for i in range(len(chunks))]
+                    else:
+                        items = [(tok, chunk, None) for tok, chunk in plan]
                     if was_playing:
-                        pending_plan = plan
+                        pending_plan = items
+                        pending_gen = gen if highlight else None
                         deadline = time.monotonic() + (self.breathing_room_ms / 1000.0)
                     else:
-                        current_id = self._speak_plan(voice, plan, current_id)
+                        current_id, sb = self._speak_plan(voice, items,
+                                                          current_id)
+                        if highlight:
+                            hl_gen = gen
+                            hl_stream_base = sb
+                            hl_last_off = -1
+                            hl_started = False
+                            hl_wait = 0
                         pending_plan = None
+                        pending_gen = None
                         deadline = None
         finally:
             comtypes.CoUninitialize()
@@ -1150,6 +1535,15 @@ class SpeakSelectionApp:
     def _swallow_checked(self, item):
         return self.swallow.is_set()
 
+    def _on_toggle_highlight(self, icon, item):
+        self.highlight = not self.highlight
+        if not self.highlight:
+            self.ui_q.put(("HL_OFF",))   # remove the bar on the UI thread
+        self.save_config()
+
+    def _highlight_checked(self, item):
+        return self.highlight
+
     def _on_open_settings(self, icon, item):
         self.ui_q.put("OPEN")
 
@@ -1169,6 +1563,8 @@ class SpeakSelectionApp:
             Menu.SEPARATOR,
             Item("Swallow side buttons", self._on_toggle_swallow,
                  checked=self._swallow_checked),
+            Item("Highlight words while reading (disabled)",
+                 self._on_toggle_highlight, checked=self._highlight_checked),
             Item("Show log...", self._on_show_log),
             Menu.SEPARATOR,
             Item("Quit", self._on_quit),
@@ -1339,6 +1735,16 @@ class SpeakSelectionApp:
                         variable=self._swallow_var,
                         command=self._on_swallow_toggle).grid(
             row=r, column=0, columnspan=3, sticky="w", pady=(10, 6))
+        r += 1
+
+        self._highlight_var = tk.BooleanVar(value=self.highlight)
+        ttk.Checkbutton(
+            frm,
+            text="Highlight (underline) each word while reading "
+                 "(temporarily disabled)",
+            variable=self._highlight_var,
+            command=self._on_highlight_toggle).grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(0, 6))
         r += 1
 
         ttk.Label(frm, text="Read button").grid(row=r, column=0, sticky="w",
@@ -1512,6 +1918,12 @@ class SpeakSelectionApp:
         self.per_sentence = bool(self._per_sentence_var.get())
         self.save_config()
 
+    def _on_highlight_toggle(self):
+        self.highlight = bool(self._highlight_var.get())
+        if not self.highlight and self._hl_bar is not None:
+            self._hl_bar.destroy()       # this runs on the Tk thread
+        self.save_config()
+
     def _on_read_button(self, _evt):
         rb = self._btn_label_to_value(self._read_combo.get())
         if rb == self.stop_button:
@@ -1587,11 +1999,50 @@ class SpeakSelectionApp:
 
     # ----- main-thread tick ---------------------------------------------
 
+    def _highlight_bar(self):
+        if self._hl_bar is None:
+            self._hl_bar = HighlightBar(self.root)
+        return self._hl_bar
+
+    def _handle_hl(self, msg):
+        kind = msg[0]
+        if kind == "HL_MAP":
+            _, gen, spans, index_to_box = msg
+            self._hl_cur_gen = gen
+            self._hl_spans = spans
+            self._hl_index_to_box = index_to_box
+            self._hl_last_idx = None
+        elif kind == "HL_OFF":
+            if self._hl_bar is not None:
+                self._hl_bar.destroy()
+        elif kind == "HL":
+            _, gen, off = msg
+            if not self.highlight:        # toggled off mid-read; stop drawing
+                if self._hl_bar is not None:
+                    self._hl_bar.hide()
+                return
+            if gen != self._hl_cur_gen or not self._hl_spans:
+                return
+            idx = word_at_offset(self._hl_spans, off)
+            if idx is None or idx == self._hl_last_idx:
+                return                       # same word -> nothing to do
+            self._hl_last_idx = idx
+            box = self._hl_index_to_box.get(idx) if self._hl_index_to_box else None
+            if box:  # missing box (OCR miss) -> hold on the previous word
+                x, y, w, h = box
+                self._highlight_bar().show(x, y, w, h)
+        elif kind == "HL_END":
+            _, gen = msg
+            if gen == self._hl_cur_gen and self._hl_bar is not None:
+                self._hl_bar.hide()
+
     def _tick(self):
         try:
             while True:
                 msg = self.ui_q.get_nowait()
-                if msg == "OPEN":
+                if isinstance(msg, tuple):
+                    self._handle_hl(msg)
+                elif msg == "OPEN":
                     self._open_settings()
                 elif msg == "LOG":
                     self._open_log()
@@ -1603,8 +2054,9 @@ class SpeakSelectionApp:
 
         self._tick_count += 1
 
-        # keep the log window live
-        if self.log_win is not None:
+        # The heavier upkeep (log refresh, theme follow) runs ~every 240 ms; the
+        # fast 30 ms cadence is so the highlight bar tracks the spoken word.
+        if self.log_win is not None and self._tick_count % 8 == 0:
             try:
                 if self.log_win.winfo_viewable():
                     self._refresh_log()
@@ -1631,7 +2083,7 @@ class SpeakSelectionApp:
                     except Exception:
                         pass
 
-        self.root.after(250, self._tick)
+        self.root.after(20, self._tick)
 
     # ----- lifecycle -----------------------------------------------------
 
@@ -1724,8 +2176,23 @@ def _pause_if_console():
         pass
 
 
+def _set_dpi_aware():
+    # Per-monitor DPI aware so screenshot pixels, window rectangles and the
+    # highlight overlay all share one coordinate space (the reading highlighter
+    # needs this; it's a no-op at 100% display scaling).
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def main():
     _setup_logging()
+    _set_dpi_aware()
     log.info("starting. python=%s platform=%s", sys.version.split()[0],
             sys.platform)
     log.info("config: %s", _config_path())
