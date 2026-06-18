@@ -263,3 +263,36 @@ def test_plan_detection_failure_falls_back():
     plan = ss.plan_voices(True, False, chunks, "???", NO_OVERRIDES,
                           LANG_INDEX, FALLBACK, detect=lambda t: None)
     assert plan == [(FALLBACK, "???")]
+
+
+# ---------------------------------------------------------------------------
+# is_copyable_clipboard_format
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("fmt", [
+    2,      # CF_BITMAP
+    3,      # CF_METAFILEPICT
+    9,      # CF_PALETTE
+    14,     # CF_ENHMETAFILE
+    0x80,   # CF_OWNERDISPLAY
+    0x82,   # CF_DSPBITMAP
+    0x83,   # CF_DSPMETAFILEPICT
+    0x8E,   # CF_DSPENHMETAFILE
+])
+def test_gdi_handle_formats_are_skipped(fmt):
+    assert ss.is_copyable_clipboard_format(fmt) is False
+
+
+@pytest.mark.parametrize("fmt", [
+    1,       # CF_TEXT
+    7,       # CF_OEMTEXT
+    8,       # CF_DIB
+    13,      # CF_UNICODETEXT
+    15,      # CF_HDROP (files)
+    16,      # CF_LOCALE
+    17,      # CF_DIBV5
+    0xC001,  # a registered format (e.g. "HTML Format", "PNG")
+    0xC0FF,
+])
+def test_memory_formats_are_copyable(fmt):
+    assert ss.is_copyable_clipboard_format(fmt) is True

@@ -95,6 +95,19 @@ SRSE_IS_SPEAKING = 2
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 
+# Clipboard formats whose data is a GDI/special handle rather than an HGLOBAL
+# memory block, so we can't snapshot/restore them by copying bytes. Skipped when
+# preserving the clipboard during capture. CF_BITMAP, CF_METAFILEPICT,
+# CF_PALETTE, CF_ENHMETAFILE, CF_OWNERDISPLAY, and the CF_DSP* display variants.
+SKIP_CLIPBOARD_FORMATS = {2, 3, 9, 14, 0x80, 0x82, 0x83, 0x8E}
+
+
+def is_copyable_clipboard_format(fmt):
+    """True if a clipboard format's data is an HGLOBAL we can copy as bytes.
+    Apps that publish a bitmap/metafile almost always also publish a CF_DIB, so
+    images still survive even though the GDI handle formats are skipped."""
+    return fmt not in SKIP_CLIPBOARD_FORMATS
+
 BTN_FORWARD = 2
 BTN_BACK = 1
 BTN_LABELS = {BTN_FORWARD: "Forward (front side button)",
@@ -251,18 +264,32 @@ def iso_to_primary_lang(iso):
     return ISO_TO_PRIMARY_LANG.get(iso.lower())
 
 
+# Detect on a prefix only: the first few hundred characters settle the language
+# and it keeps detection fast on very long selections.
+MAX_DETECT_CHARS = 1000
+
+
 def detect_language(text):
     """Best-effort offline language detection. Returns an ISO 639-1 code (e.g.
     'en', 'pt') or None. langdetect is imported lazily and seeded so results are
-    deterministic; any failure (empty text, no model, ambiguous) yields None."""
+    deterministic; any failure (empty text, no model, ambiguous) yields None.
+
+    The first call is slow (langdetect loads its language profiles); warm it up
+    off the playback path with warm_up_langdetect()."""
     if not text or not text.strip():
         return None
     try:
         from langdetect import detect, DetectorFactory
         DetectorFactory.seed = 0
-        return detect(text)
+        return detect(text[:MAX_DETECT_CHARS])
     except Exception:
         return None
+
+
+def warm_up_langdetect():
+    """Force langdetect to load its profiles (the ~300 ms one-time cost) so the
+    first real detection during playback is fast. Safe to call repeatedly."""
+    detect_language("warming up the language detector")
 
 
 def voice_for_language(iso, overrides, lang_index, fallback):
@@ -339,6 +366,10 @@ class _Win32:
         u32.SetClipboardData.restype = wintypes.HANDLE
         u32.GetClipboardSequenceNumber.argtypes = []
         u32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+        u32.EnumClipboardFormats.argtypes = [wintypes.UINT]
+        u32.EnumClipboardFormats.restype = wintypes.UINT
+        u32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+        u32.RegisterClipboardFormatW.restype = wintypes.UINT
 
         k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
         k32.GlobalAlloc.restype = wintypes.HGLOBAL
@@ -346,6 +377,20 @@ class _Win32:
         k32.GlobalLock.restype = wintypes.LPVOID
         k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
         k32.GlobalUnlock.restype = wintypes.BOOL
+        k32.GlobalSize.argtypes = [wintypes.HGLOBAL]
+        k32.GlobalSize.restype = ctypes.c_size_t
+
+        # Registered formats that opt a clipboard write out of clipboard history
+        # and cloud sync. We add these when *restoring* the original clipboard so
+        # the restore isn't recorded as a new (duplicate) history entry. The
+        # user's original copy stays in history; only our restore is hidden.
+        self._exclude_formats = []
+        for _name in ("ExcludeClipboardContentFromMonitorProcessing",
+                      "CanIncludeInClipboardHistory",
+                      "CanUploadToCloudClipboard"):
+            fid = u32.RegisterClipboardFormatW(_name)
+            if fid:
+                self._exclude_formats.append(fid)
 
     def _open(self, attempts=8, delay=0.01):
         for _ in range(attempts):
@@ -373,35 +418,77 @@ class _Win32:
         finally:
             self.u32.CloseClipboard()
 
-    def set_text(self, text):
-        if text is None:
-            text = ""
+    def snapshot(self):
+        """Copy every memory-backed clipboard format out as bytes so the whole
+        clipboard (text, images, file lists, rich formats) can be restored after
+        a capture. Returns a list of (format, bytes), or None if the clipboard
+        couldn't be opened."""
+        if not self._open():
+            return None
+        try:
+            items = []
+            ctypes = self.ctypes
+            fmt = self.u32.EnumClipboardFormats(0)
+            while fmt:
+                if is_copyable_clipboard_format(fmt):
+                    handle = self.u32.GetClipboardData(fmt)
+                    if handle:
+                        size = self.k32.GlobalSize(handle)
+                        if size:
+                            ptr = self.k32.GlobalLock(handle)
+                            if ptr:
+                                try:
+                                    items.append(
+                                        (fmt, ctypes.string_at(ptr, size)))
+                                finally:
+                                    self.k32.GlobalUnlock(handle)
+                fmt = self.u32.EnumClipboardFormats(fmt)
+            return items
+        finally:
+            self.u32.CloseClipboard()
+
+    def restore(self, items):
+        """Replace the clipboard contents with a snapshot from snapshot(). A
+        None snapshot (open failed earlier) is left untouched."""
+        if items is None:
+            return False
         if not self._open():
             return False
         try:
             self.u32.EmptyClipboard()
-            buf = self.ctypes.create_unicode_buffer(text)
-            size = self.ctypes.sizeof(buf)
-            handle = self.k32.GlobalAlloc(GMEM_MOVEABLE, size)
-            if not handle:
-                return False
-            ptr = self.k32.GlobalLock(handle)
-            if not ptr:
-                return False
-            self.ctypes.memmove(ptr, buf, size)
-            self.k32.GlobalUnlock(handle)
-            self.u32.SetClipboardData(CF_UNICODETEXT, handle)
+            ctypes = self.ctypes
+            self._mark_excluded_from_history()
+            for fmt, data in items:
+                size = len(data)
+                handle = self.k32.GlobalAlloc(GMEM_MOVEABLE, size)
+                if not handle:
+                    continue
+                ptr = self.k32.GlobalLock(handle)
+                if not ptr:
+                    continue
+                ctypes.memmove(ptr, data, size)
+                self.k32.GlobalUnlock(handle)
+                # System takes ownership of the handle after SetClipboardData.
+                self.u32.SetClipboardData(fmt, handle)
             return True
         finally:
             self.u32.CloseClipboard()
 
-    def empty(self):
-        if not self._open():
-            return
-        try:
-            self.u32.EmptyClipboard()
-        finally:
-            self.u32.CloseClipboard()
+    def _mark_excluded_from_history(self):
+        """Within an open clipboard session, add the opt-out marker formats so
+        this clipboard write is skipped by clipboard history and cloud sync.
+        Each carries a serialized DWORD 0."""
+        ctypes = self.ctypes
+        for fid in self._exclude_formats:
+            handle = self.k32.GlobalAlloc(GMEM_MOVEABLE, 4)
+            if not handle:
+                continue
+            ptr = self.k32.GlobalLock(handle)
+            if not ptr:
+                continue
+            ctypes.memmove(ptr, ctypes.byref(ctypes.c_uint32(0)), 4)
+            self.k32.GlobalUnlock(handle)
+            self.u32.SetClipboardData(fid, handle)
 
     def seq(self):
         return self.u32.GetClipboardSequenceNumber()
@@ -646,6 +733,7 @@ class SpeakSelectionApp:
         self.per_sentence = bool(cfg["per_sentence_switch"])
         pv = cfg["preferred_voices"]
         self.preferred_voices = list(pv) if isinstance(pv, list) else []
+        self._lang_warmed = False
         self.swallow = threading.Event()
         if cfg["swallow_side_buttons"]:
             self.swallow.set()
@@ -715,7 +803,7 @@ class SpeakSelectionApp:
 
         win = _Win32.get()
         old_seq = win.seq()
-        old_text = win.get_text()
+        old_clipboard = win.snapshot()
 
         self.kb.press(Key.ctrl)
         self.kb.press('c')
@@ -735,10 +823,7 @@ class SpeakSelectionApp:
             return None
 
         new_text = win.get_text()
-        if old_text is not None:
-            win.set_text(old_text)
-        else:
-            win.empty()
+        win.restore(old_clipboard)
 
         if not new_text or not new_text.strip():
             return None
@@ -1014,6 +1099,15 @@ class SpeakSelectionApp:
         if voice_id is None:
             voice_id = self.voice_id
         self.speech_q.put(("SAY", SAMPLE_TEXT, voice_id))
+
+    def _warm_langdetect(self):
+        # Load langdetect's profiles off the playback path (once) so the first
+        # auto-switch read doesn't stall ~300 ms loading the model.
+        if self._lang_warmed:
+            return
+        self._lang_warmed = True
+        threading.Thread(target=warm_up_langdetect, daemon=True,
+                        name="langwarm").start()
 
     # ----- mouse hook wiring --------------------------------------------
 
@@ -1410,6 +1504,8 @@ class SpeakSelectionApp:
 
     def _on_auto_switch_toggle(self):
         self.auto_switch = bool(self._auto_switch_var.get())
+        if self.auto_switch:
+            self._warm_langdetect()
         self.save_config()
 
     def _on_per_sentence_toggle(self):
@@ -1545,6 +1641,8 @@ class SpeakSelectionApp:
         threading.Thread(target=self._capture_worker, daemon=True,
                         name="capture").start()
         self._start_hook()
+        if self.auto_switch:
+            self._warm_langdetect()
 
         self.root = tk.Tk()
         self.root.withdraw()

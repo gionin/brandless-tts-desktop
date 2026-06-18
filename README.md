@@ -83,8 +83,14 @@ installing voices so it re-reads the list.
 
 ## Known limits (by design, for now)
 
-- Only clipboard **text** is preserved/restored during capture; images or file
-  lists on the clipboard aren't brought back yet.
+- Capture preserves the **whole** clipboard — text, images, and copied files
+  are all snapshotted before the synthetic copy and restored after. The restore
+  is marked to opt out of **clipboard history** and cloud sync, so restoring
+  your image/file doesn't create a duplicate entry in Win+V. The only exceptions
+  are formats published solely as a GDI handle (a bitmap/metafile with no
+  accompanying `CF_DIB`) or delayed-render data that fails to materialize — both
+  rare. Note: the synthetic copy itself still adds the *selected text* to
+  clipboard history (that copy is done by the source app, outside our control).
 - Text is now split into sentence-sized chunks before speaking (cleaner pacing
   and steadier playback of long selections), but pause/resume/skip aren't
   wired up — chunks are fed straight to SAPI's own queue.
