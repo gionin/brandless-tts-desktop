@@ -283,6 +283,27 @@ def test_gdi_handle_formats_are_skipped(fmt):
     assert ss.is_copyable_clipboard_format(fmt) is False
 
 
+def test_snap_line_boxes_straightens_a_line():
+    # Two words on one line with jittery tops/heights -> both snap to the
+    # line's average (a straight underline), x/width preserved.
+    lines = [[("Hello", 10, 100, 50, 20), ("world", 70, 104, 60, 24)]]
+    out = ss.snap_line_boxes(lines)
+    assert [t for t, _ in out] == ["Hello", "world"]
+    boxes = [b for _, b in out]
+    assert boxes[0][1] == boxes[1][1]          # same top
+    assert boxes[0][3] == boxes[1][3]          # same height
+    assert boxes[0][1] == 102 and boxes[0][3] == 22   # averages of 100/104, 20/24
+    assert (boxes[0][0], boxes[0][2]) == (10, 50)     # x/width untouched
+
+
+def test_snap_line_boxes_independent_lines_and_empty():
+    lines = [[("a", 0, 10, 5, 10)], [], [("b", 0, 200, 5, 30)]]
+    out = ss.snap_line_boxes(lines)
+    assert [t for t, _ in out] == ["a", "b"]
+    assert out[0][1][1] == 10 and out[1][1][1] == 200
+    assert ss.snap_line_boxes([]) == []
+
+
 @pytest.mark.parametrize("fmt", [
     1,       # CF_TEXT
     7,       # CF_OEMTEXT

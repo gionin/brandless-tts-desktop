@@ -61,6 +61,10 @@ DEFAULT_CONFIG = {
     "per_sentence_switch": False,  # when auto on: detect per sentence vs per read
     "preferred_voices": [],     # voice ids; the one per language to prefer
     "highlight_while_reading": False,  # OCR-based underline of the spoken word
+    "highlight_color": "#ff9500",      # underline color
+    "highlight_thickness": 3,          # underline thickness (px)
+    "highlight_offset": 0,             # vertical fine-tune (px; + lower, - higher)
+    "highlight_opacity": 0.9,          # 0.2 - 1.0
 }
 
 CAPTURE_TIMEOUT_MS = 400
@@ -311,10 +315,31 @@ def align_words(spoken_tokens, ocr_tokens):
     return mapping
 
 
+def snap_line_boxes(lines):
+    """Flatten OCR lines into a single ordered list, snapping every word on a
+    line to that line's average top and height. OCR reports slightly different
+    y/height per word; since a line of text shares a baseline, averaging gives a
+    straight, jitter-free underline.
+
+    `lines` is a list of lists of (text, x, y, w, h). Returns a flat list of
+    (text, (x, y, w, h)) with line-normalized vertical placement.
+    """
+    out = []
+    for words in lines:
+        if not words:
+            continue
+        avg_top = round(sum(wd[2] for wd in words) / len(words))
+        avg_h = round(sum(wd[4] for wd in words) / len(words))
+        for text, x, _y, w, _h in words:
+            out.append((text, (int(x), int(avg_top), int(w), int(avg_h))))
+    return out
+
+
 def ocr_words(image, origin=(0, 0)):
     """OCR a PIL image with Windows' built-in engine. Returns a list of
-    (text, (x, y, w, h)) in reading order, with boxes offset by `origin` to
-    screen coordinates. Returns None if winocr is unavailable or OCR fails."""
+    (text, (x, y, w, h)) in reading order, vertically snapped per line and
+    offset by `origin` to screen coordinates. None if winocr is unavailable or
+    OCR fails."""
     try:
         import winocr
     except Exception:
@@ -326,18 +351,19 @@ def ocr_words(image, origin=(0, 0)):
         log.exception("OCR failed")
         return None
     ox, oy = origin
-    words = []
+    lines = []
     try:
         for line in result["lines"]:
+            words = []
             for w in line["words"]:
                 r = w["bounding_rect"]
-                words.append((w["text"],
-                              (int(r["x"]) + ox, int(r["y"]) + oy,
-                               int(r["width"]), int(r["height"]))))
+                words.append((w["text"], int(r["x"]) + ox, int(r["y"]) + oy,
+                              int(r["width"]), int(r["height"])))
+            lines.append(words)
     except Exception:
         log.exception("could not parse OCR result")
         return None
-    return words
+    return snap_line_boxes(lines)
 
 
 # ----------------------------------------------------------------------------
@@ -864,8 +890,9 @@ class HighlightBar:
     """One reused borderless, click-through, topmost window drawn as a thin bar
     under the current word. Lives on the Tk main thread."""
 
-    def __init__(self, root):
+    def __init__(self, root, app):
         self.root = root
+        self.app = app          # reads live style values (color/thickness/etc.)
         self.win = None
         self._visible = False
         self._geom = None
@@ -876,7 +903,7 @@ class HighlightBar:
         w = tk.Toplevel(self.root)
         w.overrideredirect(True)
         w.attributes("-topmost", True)
-        w.configure(bg=HL_COLOR)
+        w.configure(bg=self.app.hl_color)
         w.geometry("1x1+0+0")
         w.withdraw()
         w.update_idletasks()
@@ -903,10 +930,31 @@ class HighlightBar:
                                ex | WS_EX_LAYERED | WS_EX_TRANSPARENT
                                | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
             u32.SetLayeredWindowAttributes(
-                hwnd, 0, int(255 * HL_ALPHA), 0x2)  # LWA_ALPHA
+                hwnd, 0, int(255 * self.app.hl_opacity), 0x2)  # LWA_ALPHA
         except Exception:
             log.exception("could not set highlight-bar styles")
         self.win = w
+
+    def restyle(self):
+        """Apply current color + opacity to the live window (after a settings
+        change). Thickness/offset are picked up on the next show()."""
+        if self.win is None:
+            return
+        try:
+            self.win.configure(bg=self.app.hl_color)
+            import ctypes
+            from ctypes import wintypes
+            u32 = ctypes.windll.user32
+            u32.GetAncestor.restype = wintypes.HWND
+            u32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+            u32.SetLayeredWindowAttributes.argtypes = [
+                wintypes.HWND, wintypes.DWORD, wintypes.BYTE, wintypes.DWORD]
+            hwnd = u32.GetAncestor(self.win.winfo_id(), 2)
+            u32.SetLayeredWindowAttributes(
+                hwnd, 0, int(255 * self.app.hl_opacity), 0x2)
+            self._geom = None   # force reposition with any new thickness/offset
+        except Exception:
+            log.exception("could not restyle highlight bar")
 
     def show(self, x, y, w, h):
         if not HIGHLIGHT_OVERLAY_ENABLED:   # safety: never create a window
@@ -914,8 +962,10 @@ class HighlightBar:
         try:
             self._ensure()
             width = max(1, int(w))
-            by = int(y) + int(h)            # underline at the word's baseline
-            geom = "%dx%d+%d+%d" % (width, HL_THICKNESS, int(x), by)
+            thickness = max(1, int(self.app.hl_thickness))
+            # underline at the word's baseline, plus the fine-tune offset
+            by = int(y) + int(h) + int(self.app.hl_offset)
+            geom = "%dx%d+%d+%d" % (width, thickness, int(x), by)
             if geom != self._geom:          # skip redundant moves
                 self.win.geometry(geom)
                 self._geom = geom
@@ -966,6 +1016,10 @@ class SpeakSelectionApp:
         self.preferred_voices = list(pv) if isinstance(pv, list) else []
         self._lang_warmed = False
         self.highlight = bool(cfg["highlight_while_reading"])
+        self.hl_color = str(cfg["highlight_color"])
+        self.hl_thickness = max(1, min(20, int(cfg["highlight_thickness"])))
+        self.hl_offset = max(-40, min(40, int(cfg["highlight_offset"])))
+        self.hl_opacity = max(0.2, min(1.0, float(cfg["highlight_opacity"])))
         self.swallow = threading.Event()
         if cfg["swallow_side_buttons"]:
             self.swallow.set()
@@ -1004,6 +1058,13 @@ class SpeakSelectionApp:
         self._auto_switch_var = None
         self._per_sentence_var = None
         self._highlight_var = None
+        self._hl_swatch = None
+        self._hl_thick_var = None
+        self._hl_thick_label = None
+        self._hl_offset_var = None
+        self._hl_offset_label = None
+        self._hl_opacity_var = None
+        self._hl_opacity_label = None
         self._pref_listbox = None
         self._pref_add_combo = None
         self._pref_view = []
@@ -1029,6 +1090,10 @@ class SpeakSelectionApp:
             "per_sentence_switch": bool(self.per_sentence),
             "preferred_voices": list(self.preferred_voices),
             "highlight_while_reading": bool(self.highlight),
+            "highlight_color": str(self.hl_color),
+            "highlight_thickness": int(self.hl_thickness),
+            "highlight_offset": int(self.hl_offset),
+            "highlight_opacity": round(float(self.hl_opacity), 2),
         }
         try:
             os.makedirs(_config_dir(), exist_ok=True)
@@ -1754,6 +1819,8 @@ class SpeakSelectionApp:
             row=r, column=0, columnspan=3, sticky="w", pady=(0, 6))
         r += 1
 
+        r = self._build_highlight_style(frm, r)
+
         ttk.Label(frm, text="Read button").grid(row=r, column=0, sticky="w",
                                                 pady=6)
         self._read_combo = ttk.Combobox(
@@ -1877,6 +1944,96 @@ class SpeakSelectionApp:
         self.preferred_voices = [v for v in self.preferred_voices if v != vid]
         self.save_config()
         self._refresh_pref_listbox()
+
+    # ----- highlight appearance -----------------------------------------
+
+    def _build_highlight_style(self, frm, r):
+        ttk.Label(frm, text="Highlight color").grid(row=r, column=0, sticky="w",
+                                                    pady=6)
+        self._hl_swatch = tk.Label(frm, bg=self.hl_color, width=4, relief="solid",
+                                   borderwidth=1)
+        self._hl_swatch.grid(row=r, column=1, sticky="w", pady=6)
+        ttk.Button(frm, text="Choose…", command=self._on_hl_color).grid(
+            row=r, column=2, sticky="e", pady=6)
+        r += 1
+
+        ttk.Label(frm, text="Underline thickness").grid(row=r, column=0,
+                                                        sticky="w", pady=6)
+        self._hl_thick_var = tk.DoubleVar(value=self.hl_thickness)
+        tsc = ttk.Scale(frm, from_=1, to=12, orient="horizontal",
+                        variable=self._hl_thick_var, command=self._on_hl_thick_move)
+        tsc.grid(row=r, column=1, sticky="ew", pady=6, padx=(0, 8))
+        tsc.bind("<ButtonRelease-1>", self._on_hl_commit)
+        self._hl_thick_label = ttk.Label(frm, text=f"{self.hl_thickness} px",
+                                         width=6)
+        self._hl_thick_label.grid(row=r, column=2, sticky="e")
+        r += 1
+
+        ttk.Label(frm, text="Vertical offset").grid(row=r, column=0, sticky="w",
+                                                    pady=6)
+        self._hl_offset_var = tk.DoubleVar(value=self.hl_offset)
+        osc = ttk.Scale(frm, from_=-20, to=20, orient="horizontal",
+                        variable=self._hl_offset_var,
+                        command=self._on_hl_offset_move)
+        osc.grid(row=r, column=1, sticky="ew", pady=6, padx=(0, 8))
+        osc.bind("<ButtonRelease-1>", self._on_hl_commit)
+        self._hl_offset_label = ttk.Label(frm, text=f"{self.hl_offset:+d} px",
+                                          width=6)
+        self._hl_offset_label.grid(row=r, column=2, sticky="e")
+        r += 1
+
+        ttk.Label(frm, text="Opacity").grid(row=r, column=0, sticky="w", pady=6)
+        self._hl_opacity_var = tk.DoubleVar(value=self.hl_opacity)
+        psc = ttk.Scale(frm, from_=0.2, to=1.0, orient="horizontal",
+                        variable=self._hl_opacity_var,
+                        command=self._on_hl_opacity_move)
+        psc.grid(row=r, column=1, sticky="ew", pady=6, padx=(0, 8))
+        psc.bind("<ButtonRelease-1>", self._on_hl_opacity_commit)
+        self._hl_opacity_label = ttk.Label(frm, text=f"{int(self.hl_opacity*100)}%",
+                                           width=6)
+        self._hl_opacity_label.grid(row=r, column=2, sticky="e")
+        r += 1
+        return r
+
+    def _on_hl_color(self):
+        from tkinter import colorchooser
+        try:
+            _rgb, hexv = colorchooser.askcolor(
+                self.hl_color, parent=self.settings_win, title="Highlight color")
+        except Exception:
+            hexv = None
+        if hexv:
+            self.hl_color = hexv
+            if self._hl_swatch is not None:
+                self._hl_swatch.configure(bg=hexv)
+            self.save_config()
+            if self._hl_bar is not None:
+                self._hl_bar.restyle()
+
+    def _on_hl_thick_move(self, val):
+        self.hl_thickness = max(1, int(round(float(val))))
+        if self._hl_thick_label is not None:
+            self._hl_thick_label.config(text=f"{self.hl_thickness} px")
+
+    def _on_hl_offset_move(self, val):
+        self.hl_offset = int(round(float(val)))
+        if self._hl_offset_label is not None:
+            self._hl_offset_label.config(text=f"{self.hl_offset:+d} px")
+
+    def _on_hl_commit(self, _evt):
+        self.save_config()
+        if self._hl_bar is not None:
+            self._hl_bar.restyle()   # resets cached geometry so it repositions
+
+    def _on_hl_opacity_move(self, val):
+        self.hl_opacity = round(float(val), 2)
+        if self._hl_opacity_label is not None:
+            self._hl_opacity_label.config(text=f"{int(self.hl_opacity*100)}%")
+
+    def _on_hl_opacity_commit(self, _evt):
+        self.save_config()
+        if self._hl_bar is not None:
+            self._hl_bar.restyle()
 
     def _on_voice_select(self, _evt):
         idx = self._voice_combo.current()
@@ -2008,7 +2165,7 @@ class SpeakSelectionApp:
 
     def _highlight_bar(self):
         if self._hl_bar is None:
-            self._hl_bar = HighlightBar(self.root)
+            self._hl_bar = HighlightBar(self.root, self)
         return self._hl_bar
 
     def _handle_hl(self, msg):

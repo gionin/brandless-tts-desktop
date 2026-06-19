@@ -56,6 +56,11 @@ Everything saves immediately. No Save button.
 With this on (Settings checkbox or the tray menu), a thin underline bar follows
 the word being spoken — in **any** app, including browsers and PDF readers.
 
+**Appearance (Settings):** colour, underline thickness, opacity, and a vertical
+**offset** for fine-tuning where the underline sits. Each word's underline is
+snapped to its text line's average top/height, so the bar stays straight even
+though OCR reports slightly different boxes per word.
+
 The overlay is click-through (it never intercepts your mouse): the transparent
 style is applied to the real top-level window via `GetAncestor(GA_ROOT)`, which
 an earlier version got wrong. A watchdog also auto-hides the bar if updates stop,
