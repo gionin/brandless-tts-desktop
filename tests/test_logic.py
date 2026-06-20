@@ -283,6 +283,44 @@ def test_gdi_handle_formats_are_skipped(fmt):
     assert ss.is_copyable_clipboard_format(fmt) is False
 
 
+def test_soft_spaces_is_length_preserving():
+    s = "line one\nline two\tend\r\nlast"
+    out = ss.soft_spaces(s)
+    assert len(out) == len(s)          # 1:1 so offsets stay aligned
+    assert "\n" not in out and "\t" not in out and "\r" not in out
+    assert out == "line one line two end  last"
+
+
+def test_merge_runs_joins_same_voice_non_highlight():
+    # All one voice -> a single block joined by spaces.
+    chunks = ["One.", "Two.", "Three."]
+    tokens = ["V", "V", "V"]
+    items = ss.merge_runs(tokens, chunks, None, "")
+    assert items == [("V", "One. Two. Three.", None)]
+
+
+def test_merge_runs_splits_on_voice_change_non_highlight():
+    chunks = ["Hello.", "Olá.", "Bye."]
+    tokens = ["EN", "PT", "EN"]
+    items = ss.merge_runs(tokens, chunks, None, "")
+    assert items == [("EN", "Hello.", None), ("PT", "Olá.", None),
+                     ("EN", "Bye.", None)]
+
+
+def test_merge_runs_highlight_uses_contiguous_soft_spaced_slice():
+    full = "Alpha beta.\nGamma delta."
+    # chunk bases as split_sentences_spans would produce
+    chunks = ["Alpha beta.", "Gamma delta."]
+    bases = [0, full.index("Gamma")]
+    tokens = ["V", "V"]
+    items = ss.merge_runs(tokens, chunks, bases, full)
+    assert len(items) == 1
+    tok, block, base = items[0]
+    assert tok == "V" and base == 0
+    assert "\n" not in block                       # soft-spaced
+    assert len(block) == bases[1] + len(chunks[1]) # contiguous slice, offsets kept
+
+
 def test_snap_line_boxes_straightens_a_line():
     # Two words on one line with jittery tops/heights -> both snap to the
     # line's average (a straight underline), x/width preserved.

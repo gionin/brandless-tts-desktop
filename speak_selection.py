@@ -286,6 +286,40 @@ def word_at_offset(spans, offset):
     return None
 
 
+def soft_spaces(s):
+    """Replace newlines/tabs with spaces, 1:1 (length-preserving). SAPI tends to
+    insert a long pause at a line break; turning them into spaces smooths pacing
+    while keeping character offsets aligned (important for the highlighter)."""
+    return re.sub(r"[\r\n\t\f\v]", " ", s)
+
+
+def merge_runs(tokens, chunks, bases, full_text):
+    """Group consecutive chunks that share a voice token into one speech block,
+    so SAPI reads them as continuous prose (one utterance) instead of one
+    utterance per sentence — which removes the awkward inter-sentence pause.
+
+    `tokens[i]` is the voice for `chunks[i]`. With `bases` (highlight mode) each
+    block is the contiguous slice of `full_text` from the first chunk's base to
+    the last chunk's end, soft-spaced and offset-tagged with that base. Without
+    `bases`, blocks are the chunks joined by a space (base None).
+    Returns a list of (token, text, base).
+    """
+    items = []
+    i, n = 0, len(chunks)
+    while i < n:
+        j = i
+        while j + 1 < n and tokens[j + 1] == tokens[i]:
+            j += 1
+        if bases is not None:
+            start = bases[i]
+            end = bases[j] + len(chunks[j])
+            items.append((tokens[i], soft_spaces(full_text[start:end]), start))
+        else:
+            items.append((tokens[i], " ".join(chunks[i:j + 1]), None))
+        i = j + 1
+    return items
+
+
 def normalize_token(s):
     """Lowercase, keep only alphanumerics — for fuzzy word matching."""
     return "".join(ch for ch in s.lower() if ch.isalnum())
@@ -1505,8 +1539,10 @@ class SpeakSelectionApp:
                     if highlight:
                         chunk_bases = split_sentences_spans(text)
                         chunks = [c for c, _b in chunk_bases]
+                        bases = [b for _c, b in chunk_bases]
                     else:
                         chunks = split_sentences(text)
+                        bases = None
                     if not chunks:
                         continue
                     was_playing = (self._is_speaking(voice)
@@ -1519,11 +1555,10 @@ class SpeakSelectionApp:
                     overrides = self._preferred_overrides(by_id, id_to_prim)
                     plan = self._plan_voices(chunks, text, overrides,
                                              lang_index, fallback_token)
-                    if highlight:
-                        items = [(plan[i][0], chunks[i], chunk_bases[i][1])
-                                 for i in range(len(chunks))]
-                    else:
-                        items = [(tok, chunk, None) for tok, chunk in plan]
+                    tokens = [p[0] for p in plan]
+                    # Merge same-voice runs into one utterance each, so SAPI
+                    # paces them as continuous prose (no per-sentence gap).
+                    items = merge_runs(tokens, chunks, bases, text)
                     if was_playing:
                         pending_plan = items
                         pending_gen = gen if highlight else None
